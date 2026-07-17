@@ -50,7 +50,12 @@ async function handler(event) {
 		}
 
 		var host = request.headers.host ? request.headers.host.value : '';
-		if (!isProtected(host, request.uri, await readProtectedPaths(kvs))) return request;
+		// NB: the CloudFront Functions runtime rejects `await` inside a function
+		// CALL's arguments ("await in arguments not supported") — a COMPILE error
+		// that makes the whole function invalid, which no try/catch can rescue.
+		// So every await resolves into its own statement before it is passed on.
+		var paths = await readProtectedPaths(kvs);
+		if (!isProtected(host, request.uri, paths)) return request;
 
 		var publishableKey = (await kvGet(kvs, 'publishableKey')) || '';
 		return {
