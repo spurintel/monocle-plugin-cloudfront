@@ -1,5 +1,7 @@
 import { build } from 'esbuild';
-import { copyFileSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+
+import { stripForDeploy } from './strip.mjs';
 
 // The CloudFront Function is deployed AS-WRITTEN (src/function/index.js): the
 // runtime has a hard 10 KB source limit and no module system beyond its own
@@ -12,18 +14,11 @@ mkdirSync('dist/lambda', { recursive: true });
 
 const functionSource = readFileSync(FUNCTION_SRC, 'utf8');
 
-const functionSize = Buffer.byteLength(functionSource, 'utf8');
-if (functionSize > FUNCTION_MAX_BYTES) {
-	console.error(
-		`CloudFront Function source is ${functionSize} bytes — over the ${FUNCTION_MAX_BYTES}-byte runtime limit.`
-	);
-	process.exit(1);
-}
-
 // The CloudFront Functions runtime rejects `await` inside a function call's
 // arguments ("await in arguments not supported") — a COMPILE error that bricks
 // the whole function at the edge. Node runs `f(a, await g())` fine, so tests
-// can't catch it; guard the common comma-arg form at build time instead.
+// can't catch it; guard the common comma-arg form at build time (on the SOURCE,
+// before stripping) instead.
 if (/,\s*await\b/.test(functionSource)) {
 	console.error(
 		'CloudFront Function has `await` inside call arguments (", await" found). ' +
@@ -32,7 +27,18 @@ if (/,\s*await\b/.test(functionSource)) {
 	process.exit(1);
 }
 
-copyFileSync(FUNCTION_SRC, 'dist/function/index.js');
+// Deploy a comment/whitespace-stripped copy (see strip.mjs) so the readable,
+// heavily-commented source stays well under the hard 10 KB runtime limit.
+const deployed = stripForDeploy(functionSource);
+const functionSize = Buffer.byteLength(deployed, 'utf8');
+if (functionSize > FUNCTION_MAX_BYTES) {
+	console.error(
+		`CloudFront Function is ${functionSize} bytes after stripping — over the ${FUNCTION_MAX_BYTES}-byte runtime limit.`
+	);
+	process.exit(1);
+}
+
+writeFileSync('dist/function/index.js', deployed);
 
 // The Lambda@Edge handler bundles to a single CJS file; the dashboard injects
 // config.json next to it in the deployment zip at deploy time.

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { mintCookieValue } from '../src/shared/cookies';
+import { stripForDeploy } from '../strip.mjs';
 
 const SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 const FUNCTION_PATH = join(__dirname, '../src/function/index.js');
@@ -62,8 +63,10 @@ type FnResponse = {
 };
 
 describe('CloudFront Function (viewer-request)', () => {
-	it('stays under the 10 KB runtime source limit with headroom', () => {
-		const size = Buffer.byteLength(source, 'utf8');
+	it('stays under the 10 KB runtime limit once stripped for deploy', () => {
+		// The deployed artifact is the comment-stripped source (see strip.mjs);
+		// that is what must fit the runtime's hard 10 KB cap.
+		const size = Buffer.byteLength(stripForDeploy(source), 'utf8');
 		expect(size).toBeLessThan(10240);
 	});
 
