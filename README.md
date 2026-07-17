@@ -49,6 +49,12 @@ Validated against AWS docs (July 2026):
 - A cache behavior takes **one function per event type**: the CloudFront
   Function and Lambda@Edge live on different behaviors, and the dashboard
   pre-flights existing viewer-request associations before deploying.
+- **Free flat-rate-plan distributions cannot attach a KVS-backed CloudFront
+  Function** ([plan feature matrix](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/flat-rate-pricing-plan.html)) —
+  verified live: the attach fails with "You can't associate this CloudFront
+  Function to a distribution on a Free plan tier." Customers need a Pro+ plan
+  or classic pay-as-you-go (cancelling a Free plan takes effect immediately).
+  Lambda@Edge itself is allowed on every tier.
 
 ## KeyValueStore keys (read by the CloudFront Function)
 
