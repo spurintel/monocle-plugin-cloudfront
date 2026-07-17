@@ -113,6 +113,23 @@ describe('CloudFront Function (viewer-request)', () => {
 		expect(await handler(event)).toBe(event.request);
 	});
 
+	it('fails OPEN (passes through, never 503s) if acquiring the KVS handle throws', async () => {
+		// Simulate cf.kvs() itself throwing — the module-init hazard that caused a
+		// live 503. The handler must swallow it and return the request untouched.
+		const stripped = source.replace(/^import cf from 'cloudfront';/m, '');
+		const cfStub = {
+			kvs: () => {
+				throw new Error('no key value store associated');
+			},
+		};
+		const factory = new Function('cf', 'require', `${stripped}\nreturn handler;`);
+		const handler = factory(cfStub, createRequire(import.meta.url)) as (
+			event: unknown,
+		) => Promise<unknown>;
+		const event = viewerEvent({ uri: '/account' });
+		expect(await handler(event)).toBe(event.request);
+	});
+
 	it('fails SAFE (challenges everything) when protectedPaths is missing or corrupt', async () => {
 		for (const kv of [
 			{ cookieSecret: SECRET, publishableKey: 'pk' },

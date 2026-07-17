@@ -16,7 +16,10 @@ import cf from 'cloudfront';
 //    Lambda@Edge);
 //  - crypto exposes ONLY createHash/createHmac — hence the HMAC cookie scheme
 //    shared with monocle-plugin-fastly, never AES;
-//  - Date.now() is frozen at function start, which is fine for an expiry check.
+//  - Date.now() is frozen at function start, which is fine for an expiry check;
+//  - the KVS handle is acquired INSIDE the handler (never at module top level):
+//    a throw during module init makes the function "invalid or could not run"
+//    and 503s EVERY request, so all fallible work stays inside the fail-open try.
 //
 // Config comes from the associated CloudFront KeyValueStore (keys written by
 // the Monocle dashboard; values <= 1 KB each, so protectedPaths overflows into
@@ -30,41 +33,48 @@ var crypto = require('crypto');
 var COOKIE_NAME = 'MCLVALID';
 var VERIFY_PATH = '/__mcl/verify';
 
-var kvs = cf.kvs();
-
 async function handler(event) {
 	var request = event.request;
+	try {
+		// Never intercept the verify endpoint. Its own cache behavior (Lambda@Edge)
+		// should be the only route here, but if this function is ever attached to a
+		// behavior that covers it, intercepting would dead-loop the challenge.
+		if (request.uri === VERIFY_PATH) return request;
 
-	// Never intercept the verify endpoint. Its own cache behavior (Lambda@Edge)
-	// should be the only route here, but if this function is ever attached to a
-	// behavior that covers it, intercepting would dead-loop the challenge.
-	if (request.uri === VERIFY_PATH) return request;
+		var kvs = cf.kvs();
 
-	var secret = await kvGet('cookieSecret');
-	var cookie = request.cookies && request.cookies[COOKIE_NAME];
-	if (secret && cookie && isValidCookie(cookie.value, event.viewer.ip, secret)) {
+		var secret = await kvGet(kvs, 'cookieSecret');
+		var cookie = request.cookies && request.cookies[COOKIE_NAME];
+		if (secret && cookie && isValidCookie(cookie.value, event.viewer.ip, secret)) {
+			return request;
+		}
+
+		var host = request.headers.host ? request.headers.host.value : '';
+		if (!isProtected(host, request.uri, await readProtectedPaths(kvs))) return request;
+
+		var publishableKey = (await kvGet(kvs, 'publishableKey')) || '';
+		return {
+			statusCode: 200,
+			statusDescription: 'OK',
+			headers: {
+				'content-type': { value: 'text/html' },
+				// Per-request and security-sensitive: never let a browser or
+				// intermediary cache and re-serve a stale interstitial.
+				'cache-control': { value: 'no-store, no-cache, must-revalidate' },
+				pragma: { value: 'no-cache' }
+			},
+			body: interstitial(publishableKey)
+		};
+	} catch (e) {
+		// A broken function must NEVER take the customer's whole site down: on any
+		// unexpected error, fail OPEN — let the request continue to cache/origin
+		// (degraded and unprotected) rather than 503. Mirrors the fail-open policy
+		// used when the Policy API is unreachable.
 		return request;
 	}
-
-	var host = request.headers.host ? request.headers.host.value : '';
-	if (!isProtected(host, request.uri, await readProtectedPaths())) return request;
-
-	var publishableKey = (await kvGet('publishableKey')) || '';
-	return {
-		statusCode: 200,
-		statusDescription: 'OK',
-		headers: {
-			'content-type': { value: 'text/html' },
-			// Per-request and security-sensitive: never let a browser or
-			// intermediary cache and re-serve a stale interstitial.
-			'cache-control': { value: 'no-store, no-cache, must-revalidate' },
-			pragma: { value: 'no-cache' }
-		},
-		body: interstitial(publishableKey)
-	};
 }
 
-async function kvGet(key) {
+async function kvGet(kvs, key) {
 	try {
 		return await kvs.get(key);
 	} catch (e) {
@@ -74,12 +84,12 @@ async function kvGet(key) {
 
 // protectedPaths may exceed the 1 KB KeyValueStore value cap; the dashboard
 // then writes numbered continuation keys and this concatenates them in order.
-async function readProtectedPaths() {
-	var raw = await kvGet('protectedPaths');
+async function readProtectedPaths(kvs) {
+	var raw = await kvGet(kvs, 'protectedPaths');
 	if (raw === null) return undefined;
 	var i = 1;
 	while (true) {
-		var chunk = await kvGet('protectedPaths.' + i);
+		var chunk = await kvGet(kvs, 'protectedPaths.' + i);
 		if (chunk === null) break;
 		raw += chunk;
 		i++;
