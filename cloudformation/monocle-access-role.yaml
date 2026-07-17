@@ -1,0 +1,118 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Cross-account IAM role that lets Spur Monocle deploy and manage its
+  CloudFront integration (CloudFront Function, KeyValueStore, Lambda@Edge) in
+  this account. Monocle assumes this role with the External ID shown in the
+  Monocle dashboard; no long-lived credentials are ever exchanged.
+
+Parameters:
+  SpurAccountId:
+    Type: String
+    AllowedPattern: "^[0-9]{12}$"
+    Description: >-
+      Spur's AWS account id (pre-filled by the Monocle dashboard). Only
+      principals in this account can assume the role.
+  ExternalId:
+    Type: String
+    MinLength: 8
+    MaxLength: 128
+    Description: >-
+      The External ID shown in the Monocle dashboard for this app. Required on
+      every AssumeRole call (confused-deputy defence) — keep it exactly as shown.
+  RoleName:
+    Type: String
+    Default: MonocleAccess
+    AllowedPattern: "^[A-Za-z0-9+=,.@_-]{1,64}$"
+    Description: Name for the created role.
+
+Resources:
+  MonocleAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Description: Assumed by Spur Monocle to manage its CloudFront integration.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${SpurAccountId}:root"
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "sts:ExternalId": !Ref ExternalId
+      Policies:
+        - PolicyName: MonocleCloudfrontIntegration
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Read distributions (the picker) and update the chosen one to
+              # attach/detach Monocle's behaviors and function associations.
+              - Sid: Distributions
+                Effect: Allow
+                Action:
+                  - "cloudfront:ListDistributions"
+                  - "cloudfront:GetDistribution"
+                  - "cloudfront:GetDistributionConfig"
+                  - "cloudfront:UpdateDistribution"
+                Resource: "*"
+              # Monocle's own edge resources, all named monocle-*.
+              - Sid: EdgeFunction
+                Effect: Allow
+                Action:
+                  - "cloudfront:CreateFunction"
+                  - "cloudfront:UpdateFunction"
+                  - "cloudfront:PublishFunction"
+                  - "cloudfront:DescribeFunction"
+                  - "cloudfront:DeleteFunction"
+                  - "cloudfront:GetFunction"
+                Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:function/monocle-*"
+              - Sid: KeyValueStore
+                Effect: Allow
+                Action:
+                  - "cloudfront:CreateKeyValueStore"
+                  - "cloudfront:DescribeKeyValueStore"
+                  - "cloudfront:DeleteKeyValueStore"
+                  - "cloudfront:ListKeyValueStores"
+                  - "cloudfront:UpdateKeyValueStore"
+                Resource: "*"
+              - Sid: KeyValueStoreData
+                Effect: Allow
+                Action:
+                  - "cloudfront-keyvaluestore:DescribeKeyValueStore"
+                  - "cloudfront-keyvaluestore:ListKeys"
+                  - "cloudfront-keyvaluestore:GetKey"
+                  - "cloudfront-keyvaluestore:PutKey"
+                  - "cloudfront-keyvaluestore:DeleteKey"
+                  - "cloudfront-keyvaluestore:UpdateKeys"
+                Resource: "*"
+              # The verify Lambda@Edge (us-east-1, monocle-* only).
+              # EnableReplication is what CloudFront calls when the function is
+              # associated with the distribution.
+              - Sid: VerifyLambda
+                Effect: Allow
+                Action:
+                  - "lambda:CreateFunction"
+                  - "lambda:DeleteFunction"
+                  - "lambda:GetFunction"
+                  - "lambda:PublishVersion"
+                  - "lambda:EnableReplication*"
+                Resource: !Sub "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:monocle-*"
+              # The Lambda's execution role (monocle-* only). PassRole is what
+              # lets the created role be attached to the Lambda — scoped so
+              # Monocle can never grant itself an unrelated role.
+              - Sid: LambdaRole
+                Effect: Allow
+                Action:
+                  - "iam:CreateRole"
+                  - "iam:DeleteRole"
+                  - "iam:GetRole"
+                  - "iam:PassRole"
+                  - "iam:AttachRolePolicy"
+                  - "iam:DetachRolePolicy"
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/monocle-*"
+
+Outputs:
+  RoleArn:
+    Description: Paste this into the Monocle dashboard's Connect AWS step.
+    Value: !GetAtt MonocleAccessRole.Arn
