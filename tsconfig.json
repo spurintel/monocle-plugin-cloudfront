@@ -1,0 +1,17 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "esnext",
+		"moduleResolution": "bundler",
+		"lib": ["ES2022"],
+		"strict": true,
+		"esModuleInterop": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true,
+		"resolveJsonModule": true,
+		"noEmit": true,
+		"types": ["node"]
+	},
+	"include": ["src/**/*.ts", "test/**/*.ts", "build.mjs"],
+	"exclude": ["node_modules", "dist", "src/function/index.js"]
+}
