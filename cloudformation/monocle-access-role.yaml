@@ -96,6 +96,13 @@ Resources:
                   - "lambda:DeleteFunction"
                   - "lambda:GetFunction"
                   - "lambda:PublishVersion"
+                  # UpdateFunctionCode is how a redeploy publishes a new version:
+                  # an @Edge function attached to a distribution is replicated
+                  # and cannot be deleted-and-recreated, so it is updated in
+                  # place. UpdateFunctionConfiguration is included for future
+                  # config changes that don't ship in the bundle.
+                  - "lambda:UpdateFunctionCode"
+                  - "lambda:UpdateFunctionConfiguration"
                   - "lambda:EnableReplication*"
                 Resource: !Sub "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:monocle-*"
               # The FIRST Lambda@Edge association in an account makes AWS create
