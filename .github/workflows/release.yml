@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Build Function + Lambda
+        # dist/function/index.js (deployed as-written, comment-stripped) and
+        # dist/lambda/index.js (esbuild bundle).
+        run: npm run build
+
+      - name: Stage release assets
+        # The web fetcher (lib/cloudfront/packageUtils) downloads assets named
+        # exactly function.js and lambda.js from the release tag.
+        run: |
+          cp dist/function/index.js function.js
+          cp dist/lambda/index.js lambda.js
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            function.js
+            lambda.js
+          generate_release_notes: true
