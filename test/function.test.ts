@@ -117,8 +117,8 @@ describe('CloudFront Function (viewer-request)', () => {
 	});
 
 	it('fails OPEN (passes through, never 503s) if acquiring the KVS handle throws', async () => {
-		// Simulate cf.kvs() itself throwing — the module-init hazard that caused a
-		// live 503. The handler must swallow it and return the request untouched.
+		// Simulate cf.kvs() itself throwing (the module-init hazard that caused a
+		// live 503). The handler must swallow it and return the request untouched.
 		const stripped = source.replace(/^import cf from 'cloudfront';/m, '');
 		const cfStub = {
 			kvs: () => {
@@ -140,6 +140,19 @@ describe('CloudFront Function (viewer-request)', () => {
 		]) {
 			const handler = loadHandler(kv as Record<string, string>);
 			const result = (await handler(viewerEvent({ uri: '/anything' }))) as FnResponse;
+			expect(result.statusCode).toBe(200);
+		}
+	});
+
+	it('fails SAFE (challenges) on valid-JSON but wrong-typed protectedPaths', async () => {
+		// A structurally-valid config whose patterns are not a string[] must still
+		// protect the host, never throw into the outer catch (which fails OPEN).
+		for (const patterns of [[null], [123], 'oops', {}]) {
+			const handler = loadHandler({
+				...BASE_KV,
+				protectedPaths: JSON.stringify({ 'www.example.com': patterns }),
+			});
+			const result = (await handler(viewerEvent({ uri: '/account' }))) as FnResponse;
 			expect(result.statusCode).toBe(200);
 		}
 	});

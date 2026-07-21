@@ -2,8 +2,8 @@ export const COOKIE_NAME = 'MCLVALID';
 
 // The dedicated verify endpoint. The web app creates a CloudFront cache
 // behavior for this exact path (AllowedMethods ALL, CachingDisabled) with the
-// Lambda@Edge viewer-request association — it is the ONLY place the Lambda
-// runs, keeping the expensive runtime off the per-request hot path.
+// Lambda@Edge viewer-request association: the ONLY place the Lambda runs,
+// keeping the expensive runtime off the per-request hot path.
 export const VERIFY_PATH = '/__mcl/verify';
 
 // Host for the Monocle Policy API. Note the `decrypt.` prefix: the backend

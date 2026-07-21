@@ -5,15 +5,15 @@ import { COOKIE_NAME } from './constants';
 /**
  * The cookie payload (`<clientIp>|<expiryUnixSeconds>`) is not secret; it only
  * needs to be tamper-proof so a client cannot forge or extend it. It is signed
- * with HMAC-SHA256, hex-wire-format `<payloadHex>.<hmacHex>`, keyed with the
- * HEX-DECODED cookie secret — the exact scheme monocle-plugin-fastly uses, so
+ * with HMAC-SHA256, hex wire format `<payloadHex>.<hmacHex>`, keyed with the
+ * HEX-DECODED cookie secret: the exact scheme monocle-plugin-fastly uses, so
  * cookies stay consistent across edge plugins.
  *
- * The scheme is HMAC (not AES-GCM like the Cloudflare worker) out of necessity
- * as well as parity: the CloudFront Functions runtime that VERIFIES this cookie
- * on every request exposes only `crypto.createHmac`/`createHash` — no AES.
- * The Lambda@Edge side (this module) MINTS it with node:crypto so both sides
- * compute the identical digest.
+ * HMAC (not AES-GCM like the Cloudflare worker) is necessity as well as
+ * parity: the CloudFront Functions runtime that VERIFIES this cookie on every
+ * request exposes only `crypto.createHmac`/`createHash`, no AES. This module
+ * (the Lambda@Edge side) MINTS with node:crypto so both compute the identical
+ * digest.
  */
 export function mintCookieValue(clientIp: string | null, cookieSecretHex: string, ttlSeconds = 3600): string {
 	const expiryTime = Math.floor(Date.now() / 1000) + ttlSeconds;
@@ -33,7 +33,7 @@ export function buildSetCookie(clientIp: string | null, cookieSecretHex: string)
 /**
  * Validates a cookie VALUE (`<payloadHex>.<hmacHex>`): verifies the HMAC, then
  * the bound client IP and expiry. Mirrors the CloudFront Function's inline
- * verifier (src/function/index.js) — test/function.test.ts pins the two against
+ * verifier (src/function/index.js); test/function.test.ts pins the two against
  * the same vectors so they cannot drift.
  */
 export function validateCookieValue(

@@ -5,7 +5,7 @@ import { loadConfig, type MonocleLambdaConfig } from './config';
 
 /**
  * Lambda@Edge (viewer-request, `IncludeBody: true`) for the `/__mcl/verify`
- * cache behavior — the ONLY behavior this function is associated with. The
+ * cache behavior, the ONLY behavior this function is associated with. The
  * interstitial served by the CloudFront Function POSTs the Monocle assessment
  * here; this calls the Policy API and mints the HMAC session cookie the
  * CloudFront Function validates on every subsequent request.
@@ -16,11 +16,11 @@ import { loadConfig, type MonocleLambdaConfig } from './config';
  *    `200` with a small text body;
  *  - viewer-request generated responses are capped at 40 KB (block pages are
  *    tiny);
- *  - the POSTed body arrives base64-encoded and truncated at 40 KB — ample for
+ *  - the POSTed body arrives base64-encoded and truncated at 40 KB, ample for
  *    an encrypted Monocle assessment.
  */
 
-// Minimal structural types for the Lambda@Edge event — only what's read here.
+// Minimal structural types for the Lambda@Edge event; only what's read here.
 interface EdgeHeaders {
 	[name: string]: { key?: string; value: string }[];
 }
@@ -56,7 +56,7 @@ export async function handler(event: EdgeRequestEvent): Promise<EdgeResponse> {
 	return handleVerify(event, config);
 }
 
-/** Core logic with config injected — the unit-testable seam. */
+/** Core logic with config injected: the unit-testable seam. */
 export async function handleVerify(
 	event: EdgeRequestEvent,
 	config: MonocleLambdaConfig
@@ -78,18 +78,33 @@ export async function handleVerify(
 	try {
 		const decision = await evaluateAssessment(captchaData, config.secretKey);
 		if (!decision.allowed) {
-			return config.blockResponseType ? buildBlockResponse(config) : textResponse('403', 'Blocked');
+			return denyResponse(config);
 		}
 		return allowResponse(request.clientIp, config);
 	} catch (error) {
-		// Fail open on ANY policy API failure (404 = no policy; else = degraded),
-		// matching the Fastly/Cloudflare plugins, and CRITICALLY set the cookie so
-		// the visitor isn't trapped re-challenging while the API is down.
+		// A 4xx (other than 404) means the API is REACHABLE and rejected THIS
+		// request: an undecryptable/invalid assessment or a bad secretKey. Never
+		// mint on that; it would let an attacker POST junk to /__mcl/verify and be
+		// waved through, and would silently disable the challenge site-wide on a
+		// misconfigured key. Deny instead. 404 = no policy configured, which
+		// legitimately means "allow", so it stays fail-open below.
+		if (error instanceof MonocleAPIError && error.status >= 400 && error.status < 500 && error.status !== 404) {
+			console.error(`Policy API rejected the request (status ${error.status}); denying.`);
+			return denyResponse(config);
+		}
+		// Genuine outage only (network/timeout/5xx), no policy (404), or a malformed
+		// 2xx body: fail open and CRITICALLY set the cookie so the visitor isn't
+		// trapped re-challenging while the API is down.
 		if (!(error instanceof MonocleAPIError && error.status === 404)) {
 			console.error(`Policy API error, failing open: ${String(error)}`);
 		}
 		return allowResponse(request.clientIp, config);
 	}
+}
+
+/** Deny: the configured block response, or a plain 403 when none is set. */
+function denyResponse(config: MonocleLambdaConfig): EdgeResponse {
+	return config.blockResponseType ? buildBlockResponse(config) : textResponse('403', 'Blocked');
 }
 
 function allowResponse(clientIp: string | null, config: MonocleLambdaConfig): EdgeResponse {
@@ -114,12 +129,32 @@ function textResponse(status: string, body: string): EdgeResponse {
 }
 
 /**
+ * A block-redirect target is customer config, but must still be a plain http(s)
+ * URL with no header-splitting bytes: a `javascript:`/`data:` value would run in
+ * the interstitial's `location.href`, and a CR/LF would corrupt the header. An
+ * unsafe value falls back to the HTML block page instead.
+ */
+function isSafeRedirectUrl(url: string): boolean {
+	if (/[\r\n\t]/.test(url)) return false;
+	try {
+		const parsed = new URL(url);
+		return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+	} catch {
+		return false;
+	}
+}
+
+/**
  * Deny response consumed by the interstitial's fetch handler (never a
  * navigation): X-Block-Action carries `redirect:<url>` or `html`, the same
  * contract as the Fastly/Cloudflare plugins.
  */
 function buildBlockResponse(config: MonocleLambdaConfig): EdgeResponse {
-	if (config.blockResponseType === 'redirect' && config.blockRedirectUrl) {
+	if (
+		config.blockResponseType === 'redirect' &&
+		config.blockRedirectUrl &&
+		isSafeRedirectUrl(config.blockRedirectUrl)
+	) {
 		return {
 			status: '403',
 			headers: {

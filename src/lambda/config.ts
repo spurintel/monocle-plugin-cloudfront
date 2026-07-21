@@ -12,7 +12,7 @@ import { join } from 'node:path';
  * CloudFront Function).
  */
 export interface MonocleLambdaConfig {
-	/** Monocle secret key — the Policy API bearer token. */
+	/** Monocle secret key: the Policy API bearer token. */
 	secretKey: string;
 	/** Hex HMAC key for the session cookie; the CloudFront Function verifies with the same value. */
 	cookieSecret: string;
@@ -33,9 +33,4 @@ export function loadConfig(): MonocleLambdaConfig {
 	const raw = readFileSync(join(__dirname, 'config.json'), 'utf8');
 	cached = JSON.parse(raw) as MonocleLambdaConfig;
 	return cached;
-}
-
-/** Test seam. */
-export function setConfigForTesting(config: MonocleLambdaConfig | null): void {
-	cached = config;
 }

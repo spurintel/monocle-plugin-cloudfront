@@ -18,7 +18,7 @@ Parameters:
     MaxLength: 128
     Description: >-
       The External ID shown in the Monocle dashboard for this app. Required on
-      every AssumeRole call (confused-deputy defence) — keep it exactly as shown.
+      every AssumeRole call (confused-deputy defence); keep it exactly as shown.
   RoleName:
     Type: String
     Default: MonocleAccess
@@ -106,10 +106,9 @@ Resources:
                   - "lambda:EnableReplication*"
                 Resource: !Sub "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:monocle-*"
               # The FIRST Lambda@Edge association in an account makes AWS create
-              # two service-linked roles (the Lambda replicator that copies the
-              # function to edge regions, and the CloudFront logger). Without
-              # this, that first association fails with "not authorized to
-              # create or assume a service linked role" (verified live).
+              # two service-linked roles (the Lambda replicator and the
+              # CloudFront logger); without this it fails with "not authorized
+              # to create or assume a service linked role" (verified live).
               # One-time per account; scoped to those two roles' paths only.
               - Sid: ServiceLinkedRoles
                 Effect: Allow
@@ -118,7 +117,7 @@ Resources:
                   - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/replicator.lambda.amazonaws.com/*"
                   - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/logger.cloudfront.amazonaws.com/*"
               # The Lambda's execution role (monocle-* only). PassRole is what
-              # lets the created role be attached to the Lambda — scoped so
+              # lets the created role be attached to the Lambda; scoped so
               # Monocle can never grant itself an unrelated role.
               - Sid: LambdaRole
                 Effect: Allow

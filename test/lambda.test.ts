@@ -137,4 +137,40 @@ describe('handleVerify', () => {
 		expect(result.status).toBe('200');
 		expect(errorSpy).toHaveBeenCalled();
 	});
+
+	it('DENIES (never mints) when the policy API rejects the request with a 4xx', async () => {
+		// A 4xx means the API is reachable and rejected THIS request (undecryptable
+		// assessment or bad secret key). Minting here would let an attacker POST
+		// junk and be waved through, so it must deny, not fail open.
+		mockPolicy({ ok: false, status: 400 });
+		const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+		const result = await handleVerify(verifyEvent({ captchaData: 'junk' }), CONFIG);
+		expect(result.status).toBe('403');
+		expect(result.headers?.['set-cookie']).toBeUndefined();
+		expect(errorSpy).toHaveBeenCalled();
+	});
+
+	it('DENIES with the configured block page on a 4xx and never sets a cookie', async () => {
+		mockPolicy({ ok: false, status: 422 });
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+		const result = await handleVerify(verifyEvent({ captchaData: 'junk' }), {
+			...CONFIG,
+			blockResponseType: 'html',
+			blockStatusCode: '403',
+		});
+		expect(result.headers?.['set-cookie']).toBeUndefined();
+		expect(result.body).toBeTruthy();
+	});
+
+	it('falls back to the block page for an unsafe (javascript:) redirect URL', async () => {
+		mockPolicy({ ok: true, json: { allowed: false } });
+		const result = await handleVerify(verifyEvent({ captchaData: 'assessment' }), {
+			...CONFIG,
+			blockResponseType: 'redirect',
+			blockRedirectUrl: 'javascript:alert(1)',
+		});
+		const action = result.headers?.['x-block-action']?.[0]?.value;
+		expect(action).toBe('html');
+		expect(action).not.toContain('javascript:');
+	});
 });
