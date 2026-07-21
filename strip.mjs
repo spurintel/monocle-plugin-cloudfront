@@ -1,7 +1,9 @@
 /**
  * Produces the deployable CloudFront Function from its readable source: drop
- * comment-only lines and collapse blank lines so the heavily-commented source
- * stays well under the hard 10 KB runtime limit.
+ * comment-only lines and collapse blank lines to fit the hard 10 KB runtime
+ * limit. NOTE: the stripped artifact is currently ~10.2 KB, close to the cap;
+ * the build (build.mjs) fails if it exceeds 10240 bytes, so keep the interstitial
+ * and logic lean when editing.
  *
  * Line-based and deliberately conservative — it only removes lines whose
  * TRIMMED text starts with `//` (so `//` inside string literals, e.g. the

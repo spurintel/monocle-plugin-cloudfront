@@ -82,13 +82,19 @@ export async function handleVerify(
 		}
 		return allowResponse(request.clientIp, config);
 	} catch (error) {
-		// A 4xx (other than 404) means the API is REACHABLE and rejected THIS
-		// request: an undecryptable/invalid assessment or a bad secretKey. Never
-		// mint on that; it would let an attacker POST junk to /__mcl/verify and be
-		// waved through, and would silently disable the challenge site-wide on a
-		// misconfigured key. Deny instead. 404 = no policy configured, which
-		// legitimately means "allow", so it stays fail-open below.
-		if (error instanceof MonocleAPIError && error.status >= 400 && error.status < 500 && error.status !== 404) {
+		// A 4xx (other than the transient ones below) means the API is REACHABLE
+		// and rejected THIS request: an undecryptable/invalid assessment or a bad
+		// secretKey. Never mint on that; it would let an attacker POST junk to
+		// /__mcl/verify and be waved through, and would silently disable the
+		// challenge site-wide on a misconfigured key. Deny instead. 404 (no policy
+		// = allow), 408 (request timeout) and 429 (rate limited) are transient, so
+		// they stay fail-open below.
+		if (
+			error instanceof MonocleAPIError &&
+			error.status >= 400 &&
+			error.status < 500 &&
+			![404, 408, 429].includes(error.status)
+		) {
 			console.error(`Policy API rejected the request (status ${error.status}); denying.`);
 			return denyResponse(config);
 		}
@@ -130,12 +136,12 @@ function textResponse(status: string, body: string): EdgeResponse {
 
 /**
  * A block-redirect target is customer config, but must still be a plain http(s)
- * URL with no header-splitting bytes: a `javascript:`/`data:` value would run in
- * the interstitial's `location.href`, and a CR/LF would corrupt the header. An
- * unsafe value falls back to the HTML block page instead.
+ * URL with no control bytes: a `javascript:`/`data:` value would run in the
+ * interstitial's `location.href`, and any control byte (NUL, CR, LF) would
+ * corrupt the header. An unsafe value falls back to the HTML block page instead.
  */
 function isSafeRedirectUrl(url: string): boolean {
-	if (/[\r\n\t]/.test(url)) return false;
+	if (/[\u0000-\u001f\u007f]/.test(url)) return false;
 	try {
 		const parsed = new URL(url);
 		return parsed.protocol === 'http:' || parsed.protocol === 'https:';
@@ -165,7 +171,10 @@ function buildBlockResponse(config: MonocleLambdaConfig): EdgeResponse {
 		};
 	}
 
-	const statusCode = String(parseInt(config.blockStatusCode ?? '403', 10) || 403);
+	// Block status must be 4xx/5xx: a 2xx makes the interstitial treat the block
+	// as success (its `if (r.ok)` reload path) and loop instead of blocking.
+	const parsedStatus = parseInt(config.blockStatusCode ?? '403', 10);
+	const statusCode = String(parsedStatus >= 400 && parsedStatus <= 599 ? parsedStatus : 403);
 	const title = escapeHtml(config.blockPageTitle ?? 'Access Denied');
 	const body = escapeHtml(config.blockResponseBody ?? 'This request has been blocked');
 

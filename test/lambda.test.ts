@@ -173,4 +173,37 @@ describe('handleVerify', () => {
 		expect(action).toBe('html');
 		expect(action).not.toContain('javascript:');
 	});
+
+	it('falls back to the block page for a redirect URL with a control byte', async () => {
+		// A NUL (or any control byte) would throw on the header and route the block
+		// through fail-open; it must fall back to the html block instead.
+		mockPolicy({ ok: true, json: { allowed: false } });
+		const result = await handleVerify(verifyEvent({ captchaData: 'assessment' }), {
+			...CONFIG,
+			blockResponseType: 'redirect',
+			blockRedirectUrl: 'https://example.com/\u0000evil',
+		});
+		expect(result.headers?.['x-block-action']?.[0]?.value).toBe('html');
+		expect(result.headers?.['set-cookie']).toBeUndefined();
+	});
+
+	it('clamps a 2xx block status to 403 (a 2xx would loop the interstitial)', async () => {
+		mockPolicy({ ok: true, json: { allowed: false } });
+		const result = await handleVerify(verifyEvent({ captchaData: 'assessment' }), {
+			...CONFIG,
+			blockResponseType: 'html',
+			blockStatusCode: '200',
+		});
+		expect(result.status).toBe('403');
+	});
+
+	it('FAILS OPEN (not deny) on a transient 429 from the policy API', async () => {
+		// 408/429 are transient, not "this request was rejected", so they mint like
+		// any other outage rather than hard-denying a real visitor.
+		mockPolicy({ ok: false, status: 429 });
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+		const result = await handleVerify(verifyEvent({ captchaData: 'assessment' }), CONFIG);
+		expect(result.status).toBe('200');
+		expect(validateCookieValue(setCookieValue(result as never), '203.0.113.9', CONFIG.cookieSecret)).toBe(true);
+	});
 });

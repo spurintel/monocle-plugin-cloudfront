@@ -9,9 +9,9 @@ import cf from 'cloudfront';
 //
 // Runtime constraints shaping this file (docs.aws.amazon.com/AmazonCloudFront/
 // latest/DeveloperGuide/functions-javascript-runtime-20.html):
-//  - hard 10 KB source limit (test/function.test.ts enforces headroom), so the
-//    interstitial is deliberately spartan and the only imports are the
-//    runtime's own 'cloudfront' and 'crypto';
+//  - hard 10 KB limit on the STRIPPED artifact (build.mjs fails over 10240
+//    bytes; we currently sit ~10.2 KB, so headroom is tight), which is why the
+//    interstitial is spartan and the only imports are 'cloudfront' and 'crypto';
 //  - no network and no request-body access, which is why verification lives
 //    in Lambda@Edge;
 //  - crypto exposes ONLY createHash/createHmac, hence the HMAC cookie scheme
