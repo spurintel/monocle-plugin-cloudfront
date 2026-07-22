@@ -200,4 +200,19 @@ describe('CloudFront Function (viewer-request)', () => {
 		const openEvent = viewerEvent({ uri: '/x/../about' });
 		expect(await handler(openEvent)).toBe(openEvent.request);
 	});
+
+	it('keeps a directory index (/dir/) protected under a /dir/* scope', async () => {
+		// collapsePath preserves a trailing slash so /account/ still matches
+		// /account/*, identical to the Fastly oracle. Dropping it (the earlier bug)
+		// let the directory INDEX reach the origin unchallenged while its sub-pages
+		// stayed protected.
+		const handler = loadHandler({
+			...BASE_KV,
+			protectedPaths: JSON.stringify({ 'www.example.com': ['/account/*'] }),
+		});
+		for (const uri of ['/account/', '/account/settings', '/account/../account/']) {
+			const result = (await handler(viewerEvent({ uri }))) as FnResponse;
+			expect(result.statusCode).toBe(200);
+		}
+	});
 });

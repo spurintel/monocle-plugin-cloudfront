@@ -6,8 +6,9 @@
  *
  * Copied from monocle-plugin-fastly/src/paths.ts so all edge plugins scope
  * paths identically. The CloudFront Function inlines a compact copy of this
- * logic (it cannot import bundled modules); test/function.test.ts pins the two
- * implementations against the same cases so they cannot drift.
+ * logic (it cannot import bundled modules); paths.test.ts covers this module and
+ * function.test.ts exercises the inline copy through the handler over the same
+ * classes of case (traversal, trailing slash, casing/encoding), so they can't drift.
  */
 export function matchesPathPattern(pathname: string, pattern: string): boolean {
 	const parts = pattern.split('*');
@@ -41,17 +42,23 @@ export function matchesPathPattern(pathname: string, pattern: string): boolean {
  * Collapses `.` / `..` / empty segments (RFC 3986 remove-dot-segments, simplified).
  * CloudFront hands the function the RAW un-normalised URI and forwards it raw to
  * the origin, so without this `/x/../admin` or `//admin` evades a `/admin*` scope
- * yet resolves to `/admin` at a normalising origin. Kept in sync with the inline
- * `collapsePath` in the deployed function.
+ * yet resolves to `/admin` at a normalising origin. A trailing slash is preserved
+ * (so `/checkout/` still matches a `/checkout/*` scope) to stay identical to the
+ * Fastly oracle. Kept in sync with the inline `collapsePath` in the deployed function.
  */
 function collapseDotSegments(path: string): string {
+	const leadingSlash = path.startsWith("/");
+	const trailingSlash = path.length > 1 && path.endsWith("/");
 	const out: string[] = [];
 	for (const seg of path.split("/")) {
 		if (seg === "" || seg === ".") continue;
 		if (seg === "..") out.pop();
 		else out.push(seg);
 	}
-	return "/" + out.join("/");
+	let result = out.join("/");
+	if (leadingSlash) result = `/${result}`;
+	if (trailingSlash && out.length > 0) result += "/";
+	return result || (leadingSlash ? "/" : "");
 }
 
 /**

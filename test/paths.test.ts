@@ -43,4 +43,15 @@ describe('isProtectedPath', () => {
 		expect(isProtectedPath('WWW.EXAMPLE.COM', '/LOGIN', paths)).toBe(true);
 		expect(isProtectedPath('www.example.com', '/%6Cogin', paths)).toBe(true);
 	});
+
+	it('keeps a directory index inside a /dir/* scope (trailing slash preserved)', () => {
+		const dir = { 'www.example.com': ['/checkout/*'] };
+		// The bare directory index and any traversal that resolves to it must stay
+		// protected, matching the Fastly oracle; dropping the trailing slash here
+		// would let /checkout/ reach the origin unchallenged under /checkout/*.
+		expect(isProtectedPath('www.example.com', '/checkout/', dir)).toBe(true);
+		expect(isProtectedPath('www.example.com', '/checkout/pay', dir)).toBe(true);
+		expect(isProtectedPath('www.example.com', '/checkout/../checkout/', dir)).toBe(true);
+		expect(isProtectedPath('www.example.com', '/checkout//', dir)).toBe(true);
+	});
 });

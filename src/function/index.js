@@ -9,9 +9,9 @@ import cf from 'cloudfront';
 //
 // Runtime constraints shaping this file (docs.aws.amazon.com/AmazonCloudFront/
 // latest/DeveloperGuide/functions-javascript-runtime-20.html):
-//  - hard 10 KB limit on the STRIPPED artifact (build.mjs fails over 10240
-//    bytes; we currently sit ~10.2 KB, so headroom is tight), which is why the
-//    interstitial is spartan and the only imports are 'cloudfront' and 'crypto';
+//  - hard 10240-byte limit on the STRIPPED artifact (build.mjs fails over it;
+//    we currently sit ~10235 bytes, so headroom is only a few bytes), which is
+//    why the interstitial is spartan and the only imports are 'cloudfront' and 'crypto';
 //  - no network and no request-body access, which is why verification lives
 //    in Lambda@Edge;
 //  - crypto exposes ONLY createHash/createHmac, hence the HMAC cookie scheme
@@ -58,7 +58,6 @@ async function handler(event) {
 		var publishableKey = (await kvGet(kvs, 'publishableKey')) || '';
 		return {
 			statusCode: 200,
-			statusDescription: 'OK',
 			headers: {
 				'content-type': { value: 'text/html' },
 				// Per-request and security-sensitive: never let a browser or
@@ -148,7 +147,8 @@ function isProtected(host, path, protectedPaths) {
 	// Collapse . / .. / empty segments before matching. CloudFront gives the
 	// function the RAW un-normalised URI (and forwards it raw to the origin), so
 	// without this a request like /x/../admin or //admin evades a /admin* scope
-	// yet resolves to /admin at a normalising origin. Mirrors the Fastly plugin.
+	// yet resolves to /admin at a normalising origin. Trailing slash preserved so
+	// /checkout/ still matches a /checkout/* scope, identical to the Fastly plugin.
 	path = collapsePath(path).toLowerCase();
 	for (var i = 0; i < patterns.length; i++) {
 		if (typeof patterns[i] !== 'string') return true;
@@ -163,7 +163,7 @@ function collapsePath(p) {
 		var s = segs[i];
 		if (s !== '' && s !== '.') s === '..' ? out.pop() : out.push(s);
 	}
-	return '/' + out.join('/');
+	return '/' + out.join('/') + (out.length && /\/$/.test(p) ? '/' : '');
 }
 
 function matchPattern(path, pattern) {
