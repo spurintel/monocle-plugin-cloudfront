@@ -186,4 +186,18 @@ describe('CloudFront Function (viewer-request)', () => {
 		const upper = (await handler(viewerEvent({ uri: '/ACCOUNT' }))) as FnResponse;
 		expect(upper.statusCode).toBe(200);
 	});
+
+	it('dot-segment / double-slash traversal cannot evade a scoped pattern', async () => {
+		// CloudFront forwards the raw URI, so /x/../account and //account reach the
+		// function un-normalised; without collapsing they would miss /account* and
+		// pass through, then resolve to /account at the origin. Must be challenged.
+		const handler = loadHandler(BASE_KV);
+		for (const uri of ['/x/../account', '//account', '/./account', '/a/b/../../account']) {
+			const result = (await handler(viewerEvent({ uri }))) as FnResponse;
+			expect(result.statusCode).toBe(200);
+		}
+		// A genuinely unprotected path still passes through after collapsing.
+		const openEvent = viewerEvent({ uri: '/x/../about' });
+		expect(await handler(openEvent)).toBe(openEvent.request);
+	});
 });

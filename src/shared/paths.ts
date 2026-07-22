@@ -38,17 +38,37 @@ export function matchesPathPattern(pathname: string, pattern: string): boolean {
 }
 
 /**
- * Canonicalises a pathname for scoping: percent-decode once, then lower-case, so
- * a request can't slip past a scoped pattern with `/%61dmin` or `/ADMIN` when the
- * origin would canonicalise it back to a protected path. Best-effort: malformed
- * encoding is matched as-is (still lower-cased) rather than throwing.
+ * Collapses `.` / `..` / empty segments (RFC 3986 remove-dot-segments, simplified).
+ * CloudFront hands the function the RAW un-normalised URI and forwards it raw to
+ * the origin, so without this `/x/../admin` or `//admin` evades a `/admin*` scope
+ * yet resolves to `/admin` at a normalising origin. Kept in sync with the inline
+ * `collapsePath` in the deployed function.
+ */
+function collapseDotSegments(path: string): string {
+	const out: string[] = [];
+	for (const seg of path.split("/")) {
+		if (seg === "" || seg === ".") continue;
+		if (seg === "..") out.pop();
+		else out.push(seg);
+	}
+	return "/" + out.join("/");
+}
+
+/**
+ * Canonicalises a pathname for scoping: percent-decode once, collapse dot/empty
+ * segments, then lower-case, so a request can't slip past a scoped pattern with
+ * `/%61dmin`, `/ADMIN`, `/x/../admin`, or `//admin` when the origin would
+ * canonicalise it back to a protected path. Best-effort: malformed encoding is
+ * matched as-is (still collapsed + lower-cased) rather than throwing.
  */
 function canonicalisePath(pathname: string): string {
+	let decoded: string;
 	try {
-		return decodeURIComponent(pathname).toLowerCase();
+		decoded = decodeURIComponent(pathname);
 	} catch {
-		return pathname.toLowerCase();
+		decoded = pathname;
 	}
+	return collapseDotSegments(decoded).toLowerCase();
 }
 
 /**

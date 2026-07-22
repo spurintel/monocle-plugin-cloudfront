@@ -42,8 +42,9 @@ export function validateCookieValue(
 	cookieSecretHex: string
 ): boolean {
 	if (!value) return false;
-	const [payloadHex, signatureHex] = value.split('.');
-	if (!payloadHex || !signatureHex) return false;
+	const parts = value.split('.');
+	if (parts.length !== 2 || !parts[0] || !parts[1]) return false;
+	const [payloadHex, signatureHex] = parts;
 
 	// Everything runs inside the try: a bad/empty secret or malformed hex must
 	// fail the cookie (re-challenge), never throw out of here as a 500.
@@ -56,7 +57,7 @@ export function validateCookieValue(
 		// An empty stored IP means the cookie was issued without an IP binding;
 		// skip the comparison rather than failing a cookie that could never match.
 		if (clientIpAddress !== '' && clientIp !== clientIpAddress) return false;
-		if (Math.floor(Date.now() / 1000) >= parseInt(expiryTime ?? '0', 10)) return false;
+		if (Math.floor(Date.now() / 1000) >= parseInt(expiryTime || '0', 10)) return false;
 		return true;
 	} catch {
 		return false;
