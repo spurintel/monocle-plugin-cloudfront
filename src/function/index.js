@@ -201,19 +201,19 @@ var SPUR_LOGO =
 function interstitial(publishableKey) {
 	return (
 		'<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Checking Connection…</title><style>' +
-		'body,html{height:100%;margin:0;font-family:system-ui;display:flex;justify-content:center;align-items:center;background:#fff;color:#000}' +
+		'body,html{height:100%;margin:0;font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;background:#fff;color:#000}' +
 		'a{color:#000}' +
 		'.c{text-align:center;display:flex;flex-direction:column;align-items:center;gap:1rem}' +
 		'.logo{margin-bottom:9px}' +
 		'.s,.sn{font-size:1.3rem;margin:0}' +
 		'.s::after{content:"";animation:dots 4s infinite}' +
-		'@keyframes dots{0%,25%{content:""}50%{content:"."}75%{content:".."}100%{content:"..."}}' +
+		'@keyframes dots{50%{content:"."}75%{content:".."}100%{content:"..."}}' +
 		'.t{font-size:.8rem;color:#888}.t a{color:#888;text-decoration:underline}' +
 		'@media(prefers-color-scheme:dark){body,html{background:#000;color:#fff}a{color:#fff}}' +
 		'</style></head><body><div class="c">' +
 		'<a class="logo" href="https://spur.us/platform/session-enrichment" target="_blank" rel="noreferrer">' +
 		SPUR_LOGO +
-		'</a><h1 class="s" id="s">Testing your connection</h1>' +
+		'</a><p class="s" id="s">Testing your connection</p>' +
 		'<div class="t">See our <a href="https://spur.us/terms" target="_blank" rel="noreferrer">Terms</a> and <a href="https://spur.us/privacy" target="_blank" rel="noreferrer">Privacy Policy</a></div>' +
 		'</div><script>function _err(m){var s=document.getElementById("s");s.className="sn";s.textContent=m}function _mclDone(d){fetch("' +
 		VERIFY_PATH +
