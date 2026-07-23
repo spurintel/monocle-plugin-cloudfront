@@ -22,6 +22,11 @@ export interface MonocleLambdaConfig {
 	blockPageTitle?: string;
 	blockResponseBody?: string;
 	blockRedirectUrl?: string;
+	/**
+	 * When true, log the raw Policy API decision to CloudWatch (one JSON line
+	 * per verify). Default off; toggled from the dashboard via Lambda republish.
+	 */
+	logAssessment?: boolean;
 }
 
 let cached: MonocleLambdaConfig | null = null;

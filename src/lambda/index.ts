@@ -1,6 +1,6 @@
 import { buildSetCookie } from '../shared/cookies';
 import { escapeHtml } from '../shared/escape';
-import { evaluateAssessment, MonocleAPIError } from '../shared/policy';
+import { evaluateAssessment, MonocleAPIError, type MonoclePolicyDecision } from '../shared/policy';
 import { loadConfig, type MonocleLambdaConfig } from './config';
 
 /**
@@ -77,6 +77,9 @@ export async function handleVerify(
 
 	try {
 		const decision = await evaluateAssessment(captchaData, config.secretKey);
+		// Before the allow/deny branch so both outcomes are captured. The
+		// fail-open catch below has no decision to log, so it stays silent.
+		logAssessmentLine(config, decision);
 		if (!decision.allowed) {
 			return denyResponse(config);
 		}
@@ -105,6 +108,21 @@ export async function handleVerify(
 			console.error(`Policy API error, failing open: ${String(error)}`);
 		}
 		return allowResponse(request.clientIp, config);
+	}
+}
+
+/**
+ * Optional raw-assessment logging: one JSON line per verify via console.log,
+ * which Lambda@Edge ships to CloudWatch in the region that served the request.
+ * Off unless the baked config sets `logAssessment: true`, and never throws;
+ * an unserializable decision must not turn a routine verify into a 500.
+ */
+function logAssessmentLine(config: MonocleLambdaConfig, decision: MonoclePolicyDecision): void {
+	if (config.logAssessment !== true) return;
+	try {
+		console.log(JSON.stringify({ monocle: 'assessment', ...decision }));
+	} catch {
+		// Swallow: logging is best-effort and must never affect the verify.
 	}
 }
 

@@ -207,3 +207,52 @@ describe('handleVerify', () => {
 		expect(validateCookieValue(setCookieValue(result as never), '203.0.113.9', CONFIG.cookieSecret)).toBe(true);
 	});
 });
+
+describe('assessment logging', () => {
+	it('logs nothing when logAssessment is absent from the config', async () => {
+		mockPolicy({ ok: true, json: { allowed: true, ip: '203.0.113.9' } });
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+		await handleVerify(verifyEvent({ captchaData: 'assessment' }), CONFIG);
+		expect(logSpy).not.toHaveBeenCalled();
+	});
+
+	it('logs one JSON line with the decision fields when logAssessment is true', async () => {
+		mockPolicy({ ok: true, json: { allowed: true, ip: '203.0.113.9', service: 'vpn' } });
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+		await handleVerify(verifyEvent({ captchaData: 'assessment' }), { ...CONFIG, logAssessment: true });
+
+		expect(logSpy).toHaveBeenCalledTimes(1);
+		const line = logSpy.mock.calls[0][0] as string;
+		expect(line).toContain('"monocle":"assessment"');
+		expect(JSON.parse(line)).toEqual({
+			monocle: 'assessment',
+			allowed: true,
+			ip: '203.0.113.9',
+			service: 'vpn',
+		});
+	});
+
+	it('logs the decision on deny too (before the allow/deny branch)', async () => {
+		mockPolicy({ ok: true, json: { allowed: false } });
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+		const result = await handleVerify(verifyEvent({ captchaData: 'assessment' }), {
+			...CONFIG,
+			logAssessment: true,
+		});
+		expect(result.status).toBe('403');
+		expect(logSpy).toHaveBeenCalledTimes(1);
+		expect(JSON.parse(logSpy.mock.calls[0][0] as string)).toEqual({ monocle: 'assessment', allowed: false });
+	});
+
+	it('logs nothing on the fail-open path (no decision exists to log)', async () => {
+		mockPolicy({ ok: false, status: 500 });
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+		const result = await handleVerify(verifyEvent({ captchaData: 'assessment' }), {
+			...CONFIG,
+			logAssessment: true,
+		});
+		expect(result.status).toBe('200');
+		expect(logSpy).not.toHaveBeenCalled();
+	});
+});
