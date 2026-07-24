@@ -36,6 +36,12 @@ export async function evaluateAssessment(
 			TOKEN: secretKey,
 		},
 		body: JSON.stringify({ assessment }),
+		// The Lambda runs as a viewer-request trigger with a hard 5 s cap: a HUNG
+		// (vs refused) Policy API would blow that cap and CloudFront would 503,
+		// bypassing the caller's fail-open catch entirely. Abort well inside the
+		// cap so a hang surfaces as a TimeoutError that fails open like any other
+		// outage.
+		signal: AbortSignal.timeout(3000),
 	});
 
 	if (!response.ok) {
