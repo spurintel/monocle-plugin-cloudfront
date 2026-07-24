@@ -86,6 +86,13 @@ describe('CloudFront Function (viewer-request)', () => {
 		expect(result.headers?.['cache-control']?.value).toContain('no-store');
 		expect(result.body).toContain('mcl.js?tk=pk_live_123');
 		expect(result.body).toContain('/__mcl/verify');
+		// The Inter stylesheet must load async (media="print", swapped onload): a
+		// pending same-head stylesheet blocks the challenge <script>, so a
+		// synchronous font link stalls the whole challenge wherever
+		// fonts.googleapis.com hangs.
+		expect(result.body).toContain(
+			'href="https://fonts.googleapis.com/css2?family=Inter&display=swap" media="print" onload="this.media=\'all\'"',
+		);
 	});
 
 	it('rejects a tampered cookie and challenges', async () => {
