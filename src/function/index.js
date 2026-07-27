@@ -10,7 +10,7 @@ import cf from 'cloudfront';
 // Runtime constraints shaping this file (docs.aws.amazon.com/AmazonCloudFront/
 // latest/DeveloperGuide/functions-javascript-runtime-20.html):
 //  - hard 10240-byte limit on the STRIPPED artifact (build.mjs fails over it; we
-//    sit ~9740 bytes, having rounded the wordmark SVG coordinates to free room for
+//    sit ~9780 bytes, having rounded the wordmark SVG coordinates to free room for
 //    the Inter webfont link), so keep the interstitial lean and imports to 'cloudfront'/'crypto';
 //  - no network and no request-body access, which is why verification lives
 //    in Lambda@Edge;
@@ -187,7 +187,8 @@ function matchPattern(path, pattern) {
 	return index <= limit;
 }
 
-// Spur wordmark, inlined so the interstitial makes no external image request.
+// Spur wordmark, inlined as SVG so no image request is needed (the page's only
+// external requests are the mcl.js script and the async Inter stylesheet).
 // Matches the Cloudflare/Fastly captcha_page.html wordmark; path coordinates are
 // rounded to 3 decimals (a sub-pixel, invisible change) to free budget for the
 // Inter webfont link so this interstitial matches the Cloudflare page's type.
@@ -196,13 +197,18 @@ var SPUR_LOGO =
 
 // Branded challenge page, matching the Cloudflare/Fastly captcha_page.html
 // (Spur wordmark, animated "Testing your connection", terms links, dark mode).
+// The Inter stylesheet loads async (media="print", swapped onload): a pending
+// same-head stylesheet blocks <script> execution, so a synchronous font link
+// would stall the whole challenge wherever fonts.googleapis.com hangs (e.g.
+// networks that black-hole Google). The fallback stack covers the interim; no
+// <noscript> fallback since the page requires JS anyway.
 // Runs Monocle, POSTs the assessment to /__mcl/verify, then reloads; the fresh
 // request carries the minted cookie and passes straight through. Response
 // contract: X-Block-Action redirect:<url> or html, 403 => denial text, else
 // fail open (reload).
 function interstitial(publishableKey) {
 	return (
-		'<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Checking Connection…</title><link href="https://fonts.googleapis.com/css2?family=Inter&display=swap" rel="stylesheet"><style>' +
+		'<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Checking Connection…</title><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter&display=swap" media="print" onload="this.media=\'all\'"><style>' +
 		'body,html{height:100%;margin:0;font-family:"Inter",system-ui,sans-serif;display:flex;justify-content:center;align-items:center;background:#fff;color:#000}' +
 		'a{color:#000}' +
 		'.c{text-align:center;display:flex;flex-direction:column;align-items:center;gap:1rem}' +
