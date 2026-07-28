@@ -43,8 +43,17 @@ async function handler(event) {
 		var kvs = cf.kvs();
 
 		var secret = await kvGet(kvs, 'cookieSecret');
+		// No secret means no cookie can ever validate, so challenging would loop
+		// forever: fail OPEN instead. Happens while a fresh deploy's KVS data
+		// propagates POP by POP (minutes), where the alternative is an
+		// unpassable challenge, i.e. an outage. Not attacker-reachable: KVS
+		// reads are POP-local, so a visitor cannot induce this to skip the
+		// challenge. Missing protectedPaths stays fail-SAFE below, because that
+		// challenge IS passable.
+		if (!secret) return request;
+
 		var cookie = request.cookies && request.cookies[COOKIE_NAME];
-		if (secret && cookie && isValidCookie(cookie.value, event.viewer.ip, secret)) {
+		if (cookie && isValidCookie(cookie.value, event.viewer.ip, secret)) {
 			return request;
 		}
 
