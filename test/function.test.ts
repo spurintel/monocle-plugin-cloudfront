@@ -179,11 +179,29 @@ describe('CloudFront Function (viewer-request)', () => {
 		expect(await handler(openEvent)).toBe(openEvent.request);
 	});
 
-	it('challenges (fails safe) when the cookie secret key is missing entirely', async () => {
+	it('fails OPEN when the cookie secret is missing, because that challenge is unpassable', async () => {
+		// A fresh deploy propagates the distribution, KVS data and Lambda
+		// independently, so a POP can serve the function before the secret is
+		// readable. Without the secret no cookie can validate, so challenging
+		// would loop the visitor forever: pass through (unprotected) instead.
 		const handler = loadHandler({ publishableKey: 'pk', protectedPaths: BASE_KV.protectedPaths });
-		const cookie = mintCookieValue('203.0.113.9', SECRET);
-		const result = (await handler(viewerEvent({ cookie }))) as FnResponse;
+		const event = viewerEvent({ uri: '/account' });
+		expect(await handler(event)).toBe(event.request);
+	});
+
+	it('fails OPEN on a protected path with no cookie at all when the secret is missing', async () => {
+		const handler = loadHandler({ publishableKey: 'pk', protectedPaths: BASE_KV.protectedPaths });
+		const event = viewerEvent({ uri: '/login' });
+		expect(await handler(event)).toBe(event.request);
+	});
+
+	it('still challenges when the secret is present but the cookie is absent', async () => {
+		// Guards the boundary: the fail-open above must not leak into the normal
+		// path, where the challenge IS passable.
+		const handler = loadHandler(BASE_KV);
+		const result = (await handler(viewerEvent({ uri: '/account' }))) as FnResponse;
 		expect(result.statusCode).toBe(200);
+		expect(result.body).toContain('pk_live_123');
 	});
 
 	it('percent-encoded and re-cased paths cannot evade protection', async () => {
