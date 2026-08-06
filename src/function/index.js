@@ -27,6 +27,8 @@ import cf from 'cloudfront';
 //  - cookieSecret     hex HMAC key (also baked into the minting Lambda)
 //  - publishableKey   Monocle publishable key for the interstitial script tag
 //  - protectedPaths   JSON: { "<host>": ["/pattern*", ...] } (+ .1, .2, ... chunks)
+//  - clientIpHeader   optional custom header name the origin reads the visitor
+//                     IP from (e.g. Salesforce Commerce Cloud)
 
 var crypto = require('crypto');
 
@@ -41,6 +43,23 @@ async function handler(event) {
 		if (request.uri === VERIFY_PATH) return request;
 
 		var kvs = cf.kvs();
+
+		// Stamp the visitor IP under the configured custom header (e.g. Salesforce
+		// Commerce Cloud's Client IP Header Name) BEFORE any origin-bound return,
+		// so every pass-through path below carries it. Edge trust boundary: always
+		// overwritten, and stripped when no viewer IP is available, so an inbound
+		// client-supplied value can never reach the origin as a spoofed identity.
+		// (The verify-path return above is answered by the Lambda behavior and
+		// never reaches the origin, so it deliberately precedes this.)
+		var ipHeader = await kvGet(kvs, 'clientIpHeader');
+		if (ipHeader) {
+			ipHeader = ipHeader.toLowerCase();
+			if (event.viewer && event.viewer.ip) {
+				request.headers[ipHeader] = { value: event.viewer.ip };
+			} else {
+				delete request.headers[ipHeader];
+			}
+		}
 
 		var secret = await kvGet(kvs, 'cookieSecret');
 		// No secret means no cookie can ever validate, so challenging would loop
