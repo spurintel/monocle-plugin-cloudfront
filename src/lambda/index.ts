@@ -120,6 +120,9 @@ export async function handleVerify(
  */
 function logAssessmentLine(config: MonocleLambdaConfig, decision: MonoclePolicyDecision): void {
 	if (config.logAssessment !== true) return;
+	// The policy API omits the assessment when the plan lacks the logging
+	// entitlement, and a log line with no assessment in it is just noise.
+	if (decision.assessment == null) return;
 	try {
 		console.log(JSON.stringify({ monocle: 'assessment', ...decision }));
 	} catch {

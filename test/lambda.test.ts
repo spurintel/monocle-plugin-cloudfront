@@ -230,6 +230,8 @@ describe('handleVerify', () => {
 });
 
 describe('assessment logging', () => {
+	const ASSESSMENT = { id: 'test-assessment-id', cc: 'US', vpn: false };
+
 	it('logs nothing when logAssessment is absent from the config', async () => {
 		mockPolicy({ ok: true, json: { allowed: true, ip: '203.0.113.9' } });
 		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -238,7 +240,7 @@ describe('assessment logging', () => {
 	});
 
 	it('logs one JSON line with the decision fields when logAssessment is true', async () => {
-		mockPolicy({ ok: true, json: { allowed: true, ip: '203.0.113.9', service: 'vpn' } });
+		mockPolicy({ ok: true, json: { allowed: true, ip: '203.0.113.9', service: 'vpn', assessment: ASSESSMENT } });
 		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 		await handleVerify(verifyEvent({ captchaData: 'assessment' }), { ...CONFIG, logAssessment: true });
 
@@ -250,11 +252,12 @@ describe('assessment logging', () => {
 			allowed: true,
 			ip: '203.0.113.9',
 			service: 'vpn',
+			assessment: ASSESSMENT,
 		});
 	});
 
 	it('logs the decision on deny too (before the allow/deny branch)', async () => {
-		mockPolicy({ ok: true, json: { allowed: false } });
+		mockPolicy({ ok: true, json: { allowed: false, assessment: ASSESSMENT } });
 		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 		const result = await handleVerify(verifyEvent({ captchaData: 'assessment' }), {
 			...CONFIG,
@@ -262,7 +265,24 @@ describe('assessment logging', () => {
 		});
 		expect(result.status).toBe('403');
 		expect(logSpy).toHaveBeenCalledTimes(1);
-		expect(JSON.parse(logSpy.mock.calls[0][0] as string)).toEqual({ monocle: 'assessment', allowed: false });
+		expect(JSON.parse(logSpy.mock.calls[0][0] as string)).toEqual({
+			monocle: 'assessment',
+			allowed: false,
+			assessment: ASSESSMENT,
+		});
+	});
+
+	it('logs nothing when the policy API withholds the assessment', async () => {
+		// An org without the logging entitlement gets a decision with no
+		// assessment, so there is nothing worth writing a line about.
+		mockPolicy({ ok: true, json: { allowed: true, ip: '203.0.113.9' } });
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+		const result = await handleVerify(verifyEvent({ captchaData: 'assessment' }), {
+			...CONFIG,
+			logAssessment: true,
+		});
+		expect(result.status).not.toBe('403'); // the verdict still stands
+		expect(logSpy).not.toHaveBeenCalled();
 	});
 
 	it('logs nothing on the fail-open path (no decision exists to log)', async () => {
