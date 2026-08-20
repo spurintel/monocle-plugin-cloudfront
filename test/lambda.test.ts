@@ -122,6 +122,27 @@ describe('handleVerify', () => {
 		expect(errorSpy).toHaveBeenCalled();
 	});
 
+	it('fails open WITH a cookie when the policy fetch times out (hung API)', async () => {
+		// The fetch's AbortSignal.timeout(3000) turns a HUNG (vs refused) Policy
+		// API into a TimeoutError rejection well inside Lambda@Edge's 5 s
+		// viewer-request cap; that must route through the same fail-open path as
+		// any other outage instead of blowing the cap into a CloudFront 503.
+		const fetchMock = vi
+			.fn()
+			.mockRejectedValue(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+		vi.stubGlobal('fetch', fetchMock);
+		const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+		const result = await handleVerify(verifyEvent({ captchaData: 'assessment' }), CONFIG);
+		expect(result.status).toBe('200');
+		expect(validateCookieValue(setCookieValue(result as never), '203.0.113.9', CONFIG.cookieSecret)).toBe(true);
+		expect(errorSpy).toHaveBeenCalled();
+		// And the timeout must actually be armed on the request.
+		expect(fetchMock).toHaveBeenCalledWith(
+			expect.anything(),
+			expect.objectContaining({ signal: expect.any(AbortSignal) })
+		);
+	});
+
 	it('fails open silently on 404 (no policy configured)', async () => {
 		mockPolicy({ ok: false, status: 404 });
 		const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});

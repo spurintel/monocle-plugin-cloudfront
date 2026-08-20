@@ -101,7 +101,8 @@ export async function handleVerify(
 			console.error(`Policy API rejected the request (status ${error.status}); denying.`);
 			return denyResponse(config);
 		}
-		// Genuine outage only (network/timeout/5xx), no policy (404), or a malformed
+		// Genuine outage only (network error, the fetch's 3 s timeout abort on a
+		// hung API, or 5xx), no policy (404), or a malformed
 		// 2xx body: fail open and CRITICALLY set the cookie so the visitor isn't
 		// trapped re-challenging while the API is down.
 		if (!(error instanceof MonocleAPIError && error.status === 404)) {
