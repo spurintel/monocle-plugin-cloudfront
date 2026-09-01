@@ -129,9 +129,9 @@ function isValidCookie(value, clientIp, secretHex) {
 		var decoded = payload.toString('utf8').split('|');
 		var boundIp = decoded[0];
 		var expiry = parseInt(decoded[1] || '0', 10);
-		// An empty bound IP means the cookie was issued IP-unbound; skip the
-		// comparison rather than failing a cookie that could never match.
-		if (boundIp !== '' && boundIp !== clientIp) return false;
+		// No empty-IP exemption: skipping the comparison for an empty bound IP is
+		// what turned such a cookie into a token valid from any address.
+		if (!boundIp || boundIp !== clientIp) return false;
 		if (Math.floor(Date.now() / 1000) >= expiry) return false;
 		return true;
 	} catch (e) {

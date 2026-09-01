@@ -1,4 +1,5 @@
 import { buildSetCookie } from '../shared/cookies';
+import { isAssessmentFresh } from '../shared/policy';
 import { escapeHtml } from '../shared/escape';
 import { evaluateAssessment, MonocleAPIError } from '../shared/policy';
 import { loadConfig, type MonocleLambdaConfig } from './config';
@@ -114,13 +115,39 @@ function denyResponse(config: MonocleLambdaConfig): EdgeResponse {
 	return config.blockResponseType ? buildBlockResponse(config) : textResponse('403', 'Blocked');
 }
 
+/**
+ * Fail-open for a degraded Policy API: let this one request through without
+ * minting. No reusable credential is manufactured from an unverified bundle, and
+ * the visitor is re-challenged on their next request.
+ */
+function failOpenWithoutMinting(): EdgeResponse {
+	return {
+		status: '200',
+		statusDescription: 'OK',
+		headers: { 'cache-control': [{ key: 'Cache-Control', value: 'no-store' }] },
+		body: 'Verification unavailable',
+	};
+}
+
 function allowResponse(clientIp: string | null, config: MonocleLambdaConfig): EdgeResponse {
+	const setCookie = buildSetCookie(clientIp, config.cookieSecret);
+	// buildSetCookie returns null when no client IP is available. Reporting success
+	// without a cookie sends the visitor back cookieless to be re-challenged and
+	// fail again, so surface it as retryable instead.
+	if (!setCookie) {
+		return {
+			status: '503',
+			statusDescription: 'Service Unavailable',
+			headers: { 'retry-after': [{ key: 'Retry-After', value: '5' }] },
+			body: 'Could not establish clearance',
+		};
+	}
 	return {
 		// 200 with a body, NEVER a bodied 204 (Lambda@Edge turns that into a 502).
 		status: '200',
 		statusDescription: 'OK',
 		headers: {
-			'set-cookie': [{ key: 'Set-Cookie', value: buildSetCookie(clientIp, config.cookieSecret) }],
+			'set-cookie': [{ key: 'Set-Cookie', value: setCookie }],
 			'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
 		},
 		body: 'Captcha validated successfully',

@@ -15,6 +15,8 @@ export class MonocleAPIError extends Error {
 
 export interface MonoclePolicyDecision {
 	allowed: boolean;
+	/** Present on a real Policy response; `ts` is the assessment's generation time. */
+	assessment?: { ts?: string; [key: string]: unknown };
 	[key: string]: unknown;
 }
 
@@ -57,4 +59,37 @@ export async function evaluateAssessment(
 		throw new MonocleAPIError(response.status, 'malformed policy response');
 	}
 	return decision;
+}
+
+/** Maximum age of an assessment we will accept as proof of a live browser. */
+export const ASSESSMENT_MAX_AGE_SECONDS = 5;
+
+/** Tolerance for a client or edge clock running slightly ahead. */
+const CLOCK_SKEW_TOLERANCE_SECONDS = 5;
+
+/**
+ * Whether an assessment timestamp is recent enough to mint against.
+ *
+ * Without an age check the bundle is a durable bearer credential: one solved
+ * challenge can be replayed to mint unlimited cookies, from any number of
+ * addresses, for as long as the attacker keeps presenting it.
+ *
+ * Fails closed on a timestamp it cannot read, since an unparseable `ts` is not
+ * evidence of recency and treating it as fresh would make the check bypassable.
+ * A MISSING timestamp is handled by the caller, because that is an API-shape
+ * question rather than a client input.
+ */
+export function isAssessmentFresh(
+	ts: string | undefined,
+	maxAgeSeconds: number = ASSESSMENT_MAX_AGE_SECONDS
+): boolean {
+	if (!ts) return false;
+
+	const generatedAt = new Date(ts).getTime();
+	if (Number.isNaN(generatedAt)) return false;
+
+	const ageSeconds = (Date.now() - generatedAt) / 1000;
+	if (ageSeconds < -CLOCK_SKEW_TOLERANCE_SECONDS) return false;
+
+	return ageSeconds <= maxAgeSeconds;
 }

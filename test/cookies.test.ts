@@ -42,9 +42,19 @@ describe('mintCookieValue / validateCookieValue', () => {
 		expect(validateCookieValue(value, '198.51.100.1', SECRET)).toBe(false);
 	});
 
-	it('skips the IP check for an IP-unbound cookie (null at mint time)', () => {
-		const value = mintCookieValue(null, SECRET);
-		expect(validateCookieValue(value, '198.51.100.1', SECRET)).toBe(true);
+	it('mints nothing when no client IP is available', () => {
+		// buildSetCookie previously minted with an EMPTY ip field, and both verifiers
+		// then SKIPPED the IP comparison for any cookie whose stored IP was empty,
+		// producing a portable bearer token valid from any address for its lifetime.
+		expect(buildSetCookie(null, SECRET)).toBeNull();
+	});
+
+	it('rejects a hand-signed IP-unbound payload from any address', () => {
+		// Defence in depth for cookies minted by an older release: validation must
+		// not exempt an empty stored IP from the comparison.
+		const value = mintCookieValue('', SECRET);
+		expect(validateCookieValue(value, '198.51.100.1', SECRET)).toBe(false);
+		expect(validateCookieValue(value, null, SECRET)).toBe(false);
 	});
 
 	it('rejects an expired cookie', () => {

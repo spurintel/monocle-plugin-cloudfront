@@ -15,18 +15,32 @@ import { COOKIE_NAME } from './constants';
  * (the Lambda@Edge side) MINTS with node:crypto so both compute the identical
  * digest.
  */
-export function mintCookieValue(clientIp: string | null, cookieSecretHex: string, ttlSeconds = 3600): string {
+export function mintCookieValue(
+	clientIp: string,
+	cookieSecretHex: string,
+	ttlSeconds = 3600
+): string {
 	const expiryTime = Math.floor(Date.now() / 1000) + ttlSeconds;
-	// An empty IP issues an IP-unbound cookie rather than baking in a literal
-	// unmatchable value: a cookie that can never validate would trap the visitor
-	// in an endless challenge loop. The signature and expiry still apply.
-	const payload = `${clientIp ?? ''}|${expiryTime}`;
+	const payload = `${clientIp}|${expiryTime}`;
 	const signature = createHmac('sha256', Buffer.from(cookieSecretHex, 'hex')).update(payload).digest('hex');
 	return `${Buffer.from(payload, 'utf8').toString('hex')}.${signature}`;
 }
 
-/** Builds the full Set-Cookie header value for a freshly minted cookie. */
-export function buildSetCookie(clientIp: string | null, cookieSecretHex: string): string {
+/**
+ * Builds the full Set-Cookie header value for a freshly minted cookie, or null
+ * when no client IP is available.
+ *
+ * Previously an absent IP minted with an EMPTY ip field, and both verifiers then
+ * SKIPPED the IP comparison for any cookie whose stored IP was empty, producing
+ * a portable bearer token valid from any address for its full lifetime. The IP
+ * binding is what the whole cookie model rests on, so its absence must fail
+ * closed rather than mint something unbindable.
+ */
+export function buildSetCookie(clientIp: string | null, cookieSecretHex: string): string | null {
+	if (!clientIp) {
+		console.error('No client IP available; refusing to mint an IP-unbound cookie.');
+		return null;
+	}
 	return `${COOKIE_NAME}=${mintCookieValue(clientIp, cookieSecretHex)}; Secure; HttpOnly; Path=/; SameSite=Lax`;
 }
 
@@ -54,9 +68,10 @@ export function validateCookieValue(
 		if (expected !== signatureHex.toLowerCase()) return false;
 
 		const [clientIpAddress, expiryTime] = payload.toString('utf8').split('|');
-		// An empty stored IP means the cookie was issued without an IP binding;
-		// skip the comparison rather than failing a cookie that could never match.
-		if (clientIpAddress !== '' && clientIp !== clientIpAddress) return false;
+		// No empty-IP exemption. Nothing mints an IP-unbound cookie any more, and a
+		// stored empty IP must NOT skip this comparison: doing so is what turned such
+		// a cookie into a token valid from anywhere.
+		if (!clientIpAddress || clientIp !== clientIpAddress) return false;
 		if (Math.floor(Date.now() / 1000) >= parseInt(expiryTime || '0', 10)) return false;
 		return true;
 	} catch {
