@@ -87,7 +87,9 @@ export async function handleMclEndpoint(ctx: EndpointContext): Promise<EdgeRespo
 		// origin-request Host, which names the customer's origin, not a viewer host.
 		const allowed = [...ctx.runtime.live.hosts];
 		if (ctx.distributionDomainName) allowed.push(ctx.distributionDomainName.toLowerCase());
-		if (!originHeaderAllowed(origin, site, allowed)) return jsonResponse({ error: 'origin' }, 403);
+		const anyHostname = ctx.runtime.live.hosts.length === 0;
+		if (!originHeaderAllowed(origin, site, allowed, anyHostname))
+			return jsonResponse({ error: 'origin' }, 403);
 		return handleVerify(ctx);
 	}
 	if (ctx.canonicalPath === '/__mcl/state' && method === 'GET') return handleState(ctx);

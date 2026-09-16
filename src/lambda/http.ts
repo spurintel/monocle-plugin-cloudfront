@@ -103,7 +103,9 @@ export function viewerOrigin(hostHeader: string, distributionDomainName?: string
 export function originHeaderAllowed(
 	originHeader: string | undefined,
 	site: string,
-	allowedHostnames: string[]
+	allowedHostnames: string[],
+	/** True when the deployment names no hostname, so there is no list to match. */
+	anyHostname = false
 ): boolean {
 	if (site === 'cross-site' || site === 'same-site') return false;
 	if (!originHeader) return false;
@@ -115,5 +117,11 @@ export function originHeaderAllowed(
 	} catch {
 		return false;
 	}
+	// A deployment protecting every hostname the distribution serves cannot
+	// enumerate them, so what remains is the browser's own statement that this is
+	// its page calling its own origin - which a cross-site caller cannot truthfully
+	// make, and which a forged header buys nothing with: the cookie minted is bound
+	// to the forger's own IP.
+	if (anyHostname) return site === 'same-origin';
 	return allowedHostnames.includes(hostname);
 }

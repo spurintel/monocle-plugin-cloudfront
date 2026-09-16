@@ -16,9 +16,14 @@ async function handler(event) {
 		if (c > 0 && host.indexOf(']') === -1) host = host.slice(0, c);
 		host = host.toLowerCase();
 		var hostsRaw = await readChunks(kvs, 'hosts');
+		// Absent is a store we cannot use, which fails open like the rest of them.
+		// An empty list is a deployment that says every hostname this distribution
+		// serves - a distribution is a site, so that is the safe default, and it
+		// covers an alias added long after setup.
+		if (!hostsRaw) return req;
 		var hosts;
 		try {
-			hosts = JSON.parse(hostsRaw || '[]');
+			hosts = JSON.parse(hostsRaw);
 		} catch (e) {
 			return req;
 		}
@@ -28,8 +33,9 @@ async function handler(event) {
 		// deployment bypassable by anyone who knows the domain. A deployment still
 		// protects ONE configured hostname; this is not a second one. The Lambda
 		// already trusts it the same way when it checks the verify Origin.
+		if (!Array.isArray(hosts)) return req;
 		var own = event.context && event.context.distributionDomainName;
-		if (!Array.isArray(hosts) || (hosts.indexOf(host) === -1 && host !== (own ? own.toLowerCase() : null)))
+		if (hosts.length && hosts.indexOf(host) === -1 && host !== (own ? own.toLowerCase() : null))
 			return req;
 		var path;
 		try {

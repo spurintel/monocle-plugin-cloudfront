@@ -30,10 +30,16 @@ const BAKED: BakedConfig = {
 	kvsArn: 'arn:aws:cloudfront::123:key-value-store/abc',
 };
 
+/**
+ * A deployment naming one hostname, which is what most of these cases are about.
+ * Pass `hosts: '[]'` for the deployment that protects every hostname the
+ * distribution serves.
+ */
 function liveKvs(extra: Record<string, string> = {}) {
 	return new MemoryKvs({
 		cv: CV,
 		cfg: JSON.stringify({ session_tracking: 'off' }),
+		hosts: JSON.stringify(['www.example.com']),
 		...extra,
 	});
 }
@@ -153,6 +159,40 @@ describe('handleOriginRequest /__mcl/*', () => {
 		);
 		expect(result.status).toBe('200');
 		expect(JSON.parse(result.body ?? '{}').verdict).toBe('allow');
+	});
+
+	// A deployment protecting every hostname the distribution serves has no list to
+	// match an Origin against, so the browser's own same-origin statement is what
+	// stands in - and a cross-site caller cannot truthfully make it.
+	it('accepts a same-origin verify from any hostname when none are named', async () => {
+		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(policyResponse(true)));
+		const result = await handleOriginRequest(
+			originEvent({
+				body: { captchaData: 'bundle' },
+				headers: {
+					Origin: 'https://anything.example.com',
+					'Sec-Fetch-Site': 'same-origin',
+				},
+			}),
+			{ config: BAKED, kvs: liveKvs({ hosts: '[]' }) }
+		);
+		expect(result.status).toBe('200');
+	});
+
+	it('still refuses a verify that does not claim same-origin when none are named', async () => {
+		const fetchMock = vi.fn();
+		vi.stubGlobal('fetch', fetchMock);
+		for (const site of ['cross-site', 'same-site', 'none']) {
+			const result = await handleOriginRequest(
+				originEvent({
+					body: { captchaData: 'bundle' },
+					headers: { Origin: 'https://attacker.example', 'Sec-Fetch-Site': site },
+				}),
+				{ config: BAKED, kvs: liveKvs({ hosts: '[]' }) }
+			);
+			expect(result.status).toBe('403');
+		}
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
 	it('accepts verify Origin that matches a protected host in KVS', async () => {

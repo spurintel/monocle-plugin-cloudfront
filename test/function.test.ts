@@ -166,6 +166,25 @@ describe('CloudFront Function (viewer-request)', () => {
 		}
 	});
 
+	// A distribution is a site, so a deployment that names no hostname means every
+	// name it answers on - including one added years after setup.
+	it('protects every hostname the distribution serves when none are named', async () => {
+		for (const host of ['www.example.com', 'shop.example.com', DISTRIBUTION_DOMAIN]) {
+			const result = (await loadHandler({ ...baseKv(), hosts: '[]' })(
+				viewerEvent({ host })
+			)) as FnResponse;
+			expect(result.statusCode).toBe(503);
+		}
+	});
+
+	// Absent is a broken store, not a deployment choosing everything.
+	it('passes through when the host list is missing entirely', async () => {
+		const kv = { ...baseKv() };
+		delete kv.hosts;
+		const event = viewerEvent();
+		expect(await loadHandler(kv)(event)).toBe(event.request);
+	});
+
 	// Anyone can reach an alias deployment by its *.cloudfront.net name. Passing
 	// that through would make Monocle optional for whoever knows the domain.
 	it("protects the distribution's own domain as well as the configured host", async () => {
