@@ -118,7 +118,9 @@ Resources:
                   - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/logger.cloudfront.amazonaws.com/*"
               # The Lambda's execution role (monocle-* only). PassRole is what
               # lets the created role be attached to the Lambda; scoped so
-              # Monocle can never grant itself an unrelated role.
+              # Monocle can never grant itself an unrelated role. PutRolePolicy
+              # is how the dashboard grants that role KeyValueStore Get/Update
+              # for the breaker and crawler snapshot.
               - Sid: LambdaRole
                 Effect: Allow
                 Action:
@@ -128,7 +130,32 @@ Resources:
                   - "iam:PassRole"
                   - "iam:AttachRolePolicy"
                   - "iam:DetachRolePolicy"
+                  - "iam:PutRolePolicy"
+                  - "iam:DeleteRolePolicy"
+                  - "iam:GetRolePolicy"
                 Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/monocle-*"
+              # Hourly crawler refresh: EventBridge Scheduler in us-east-1
+              # invokes the same Lambda the distribution uses at origin-request.
+              - Sid: CrawlerSchedule
+                Effect: Allow
+                Action:
+                  - "scheduler:CreateSchedule"
+                  - "scheduler:UpdateSchedule"
+                  - "scheduler:DeleteSchedule"
+                  - "scheduler:GetSchedule"
+                  - "scheduler:ListSchedules"
+                Resource: !Sub "arn:aws:scheduler:us-east-1:${AWS::AccountId}:schedule/default/monocle-*"
+              - Sid: LambdaInvokePermission
+                Effect: Allow
+                Action:
+                  - "lambda:AddPermission"
+                  - "lambda:RemovePermission"
+                  - "lambda:GetPolicy"
+                Resource: !Sub "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:monocle-*"
+              - Sid: SchedulerServiceLinkedRole
+                Effect: Allow
+                Action: "iam:CreateServiceLinkedRole"
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/scheduler.amazonaws.com/*"
 
 Outputs:
   RoleArn:
