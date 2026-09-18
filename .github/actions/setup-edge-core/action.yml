@@ -1,0 +1,25 @@
+name: Private edge-core access
+description: Load the read-only edge-core deploy key for dependency installs.
+inputs:
+  ssh-key:
+    description: Read-only deploy key for spurintel/monocle-edge-core.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Start SSH agent
+      shell: bash
+      env:
+        EDGE_CORE_SSH_KEY: ${{ inputs.ssh-key }}
+      run: |
+        if [ -z "$EDGE_CORE_SSH_KEY" ]; then
+          echo "::error::MONOCLE_EDGE_CORE_SSH_KEY is required to install the private edge core."
+          exit 1
+        fi
+        install -d -m 700 "$HOME/.ssh"
+        cat "$GITHUB_ACTION_PATH/../../github_known_hosts" >> "$HOME/.ssh/known_hosts"
+        chmod 600 "$HOME/.ssh/known_hosts"
+        eval "$(ssh-agent -s)" >/dev/null
+        ssh-add - <<< "$EDGE_CORE_SSH_KEY"
+        printf 'SSH_AUTH_SOCK=%s\n' "$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+        printf 'SSH_AGENT_PID=%s\n' "$SSH_AGENT_PID" >> "$GITHUB_ENV"
