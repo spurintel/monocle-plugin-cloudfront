@@ -1,13 +1,10 @@
-export const COOKIE_NAME = 'MCLVALID';
+/** Shared constants for the CloudFront port. Cookie names live in edge-core. */
 
-// The dedicated verify endpoint. The web app creates a CloudFront cache
-// behavior for this exact path (AllowedMethods ALL, CachingDisabled) with the
-// Lambda@Edge viewer-request association: the ONLY place the Lambda runs,
-// keeping the expensive runtime off the per-request hot path.
-export const VERIFY_PATH = '/__mcl/verify';
+/** Host the assessment core loads from when `cfg.custom_domain` is absent. */
+export const DEFAULT_CORE_HOST = 'js.mcl.io';
 
-// Host for the Monocle Policy API. Note the `decrypt.` prefix: the backend
-// SDK targets `https://decrypt.<baseDomain>/api/v1/policy`. Lambda@Edge has
-// unrestricted outbound network access, so this is called directly (unlike
-// Akamai, no CDN-fronted origin indirection is needed).
-export const POLICY_API_URL = 'https://decrypt.mcl.spur.us/api/v1/policy';
+export const MAX_VERIFY_BODY_BYTES = 32 * 1024;
+export const KVS_VALUE_BYTES = 1024;
+export const KVS_CACHE_MS = 60_000;
+/** Browser and CloudFront cache lifetime for the resident script and challenge page. */
+export const SCRIPT_CACHE_SECONDS = 300;

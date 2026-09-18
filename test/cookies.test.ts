@@ -1,75 +1,118 @@
-import { describe, expect, it, vi, afterEach } from 'vitest';
+import { COOKIE_SCOPE, mintVerdictCookie, validateVerdictCookie } from '@spur.us/monocle-edge-core';
+import { describe, expect, it } from 'vitest';
 
-import { buildSetCookie, mintCookieValue, validateCookieValue } from '../src/shared/cookies';
-import { COOKIE_NAME } from '../src/shared/constants';
+import { createHmacSealer } from '../src/shared/hmac-sealer';
 
 const SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
-const OTHER_SECRET = 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
+const PREV = 'ff'.repeat(32);
+const CV = 'ab'.repeat(32);
+const ID = 'deploy-1';
 
-afterEach(() => {
-	vi.restoreAllMocks();
-});
-
-describe('mintCookieValue / validateCookieValue', () => {
-	it('round-trips: a minted cookie validates for the same IP and secret', () => {
-		const value = mintCookieValue('203.0.113.9', SECRET);
-		expect(validateCookieValue(value, '203.0.113.9', SECRET)).toBe(true);
+describe('createHmacSealer', () => {
+	it('round-trips plaintext', async () => {
+		const sealer = createHmacSealer(SECRET);
+		const sealed = await sealer.seal('hello');
+		expect(sealed).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+		expect(await sealer.open(sealed)).toBe('hello');
 	});
 
-	it('uses the <payloadHex>.<hmacHex> wire format over clientIp|expiry', () => {
-		vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
-		const value = mintCookieValue('203.0.113.9', SECRET);
-		const [payloadHex, sig] = value.split('.');
-		expect(Buffer.from(payloadHex!, 'hex').toString('utf8')).toBe('203.0.113.9|1700003600');
-		expect(sig).toMatch(/^[0-9a-f]{64}$/);
+	it('rejects a payload sealed with another key', async () => {
+		const sealed = await createHmacSealer(PREV).seal('other');
+		expect(await createHmacSealer(SECRET).open(sealed)).toBeNull();
 	});
 
-	it('rejects a tampered payload', () => {
-		const value = mintCookieValue('203.0.113.9', SECRET);
-		const [payloadHex, sig] = value.split('.');
-		const forged = Buffer.from('203.0.113.9|9999999999', 'utf8').toString('hex');
-		expect(forged).not.toBe(payloadHex);
-		expect(validateCookieValue(`${forged}.${sig}`, '203.0.113.9', SECRET)).toBe(false);
+	it('rejects a tampered payload', async () => {
+		const sealer = createHmacSealer(SECRET);
+		const sealed = await sealer.seal('hello');
+		const [pt] = sealed.split('.');
+		expect(await sealer.open(`${pt}.${'A'.repeat(43)}`)).toBeNull();
 	});
 
-	it('rejects a cookie signed with a different secret', () => {
-		const value = mintCookieValue('203.0.113.9', OTHER_SECRET);
-		expect(validateCookieValue(value, '203.0.113.9', SECRET)).toBe(false);
-	});
-
-	it('rejects a bound cookie presented from a different IP', () => {
-		const value = mintCookieValue('203.0.113.9', SECRET);
-		expect(validateCookieValue(value, '198.51.100.1', SECRET)).toBe(false);
-	});
-
-	it('skips the IP check for an IP-unbound cookie (null at mint time)', () => {
-		const value = mintCookieValue(null, SECRET);
-		expect(validateCookieValue(value, '198.51.100.1', SECRET)).toBe(true);
-	});
-
-	it('rejects an expired cookie', () => {
-		vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
-		const value = mintCookieValue('203.0.113.9', SECRET, 60);
-		vi.spyOn(Date, 'now').mockReturnValue(1_700_000_061_000);
-		expect(validateCookieValue(value, '203.0.113.9', SECRET)).toBe(false);
-	});
-
-	it('fails malformed values instead of throwing', () => {
-		expect(validateCookieValue(undefined, '1.2.3.4', SECRET)).toBe(false);
-		expect(validateCookieValue('', '1.2.3.4', SECRET)).toBe(false);
-		expect(validateCookieValue('nodot', '1.2.3.4', SECRET)).toBe(false);
-		expect(validateCookieValue('zz.zz', '1.2.3.4', SECRET)).toBe(false);
-		expect(validateCookieValue(mintCookieValue('1.2.3.4', SECRET), '1.2.3.4', 'not-hex')).toBe(false);
+	it('refuses a malformed sealing key', () => {
+		expect(() => createHmacSealer('not-hex')).toThrow(/Invalid sealing key/);
 	});
 });
 
-describe('buildSetCookie', () => {
-	it('emits the full Set-Cookie header with security attributes', () => {
-		const header = buildSetCookie('203.0.113.9', SECRET);
-		expect(header.startsWith(`${COOKIE_NAME}=`)).toBe(true);
-		expect(header).toContain('Secure');
-		expect(header).toContain('HttpOnly');
-		expect(header).toContain('Path=/');
-		expect(header).toContain('SameSite=Lax');
+describe('mintVerdictCookie / validateVerdictCookie', () => {
+	it('round-trips an allow cookie for the same IP binding and audience', async () => {
+		const sealer = createHmacSealer(SECRET);
+		const minted = await mintVerdictCookie({
+			sealer,
+			audience: ID,
+			scope: COOKIE_SCOPE,
+			ipBinding: '203.0.113.9',
+			verdict: 'allow',
+			sid: 'sid',
+			jti: 'jti',
+			nowSeconds: Math.floor(Date.now() / 1000),
+			clearanceVersion: CV,
+		});
+		expect(minted.setCookie.startsWith(`${COOKIE_SCOPE.names.verdict}=`)).toBe(true);
+		expect(minted.setCookie).toContain('Secure');
+		expect(minted.setCookie).toContain('HttpOnly');
+		expect(minted.setCookie).toContain('Partitioned');
+		const value = minted.setCookie.split(';')[0]!.slice(`${COOKIE_SCOPE.names.verdict}=`.length);
+		const state = await validateVerdictCookie({
+			sealer,
+			audience: ID,
+			cookieValue: value,
+			ipBinding: '203.0.113.9',
+			nowSeconds: Math.floor(Date.now() / 1000),
+			clearanceVersion: CV,
+		});
+		expect(state.status).toBe('allow');
+	});
+
+	it('is absent for the wrong IP, audience, or clearance version', async () => {
+		const sealer = createHmacSealer(SECRET);
+		const minted = await mintVerdictCookie({
+			sealer,
+			audience: ID,
+			scope: COOKIE_SCOPE,
+			ipBinding: '203.0.113.9',
+			verdict: 'allow',
+			sid: 'sid',
+			jti: 'jti',
+			nowSeconds: Math.floor(Date.now() / 1000),
+			clearanceVersion: CV,
+		});
+		const value = minted.setCookie.split(';')[0]!.slice(`${COOKIE_SCOPE.names.verdict}=`.length);
+		const now = Math.floor(Date.now() / 1000);
+		expect(
+			(
+				await validateVerdictCookie({
+					sealer,
+					audience: ID,
+					cookieValue: value,
+					ipBinding: '198.51.100.1',
+					nowSeconds: now,
+					clearanceVersion: CV,
+				})
+			).status
+		).toBe('absent');
+		expect(
+			(
+				await validateVerdictCookie({
+					sealer,
+					audience: 'other',
+					cookieValue: value,
+					ipBinding: '203.0.113.9',
+					nowSeconds: now,
+					clearanceVersion: CV,
+				})
+			).status
+		).toBe('absent');
+		expect(
+			(
+				await validateVerdictCookie({
+					sealer,
+					audience: ID,
+					cookieValue: value,
+					ipBinding: '203.0.113.9',
+					nowSeconds: now,
+					clearanceVersion: '00'.repeat(32),
+				})
+			).status
+		).toBe('absent');
 	});
 });

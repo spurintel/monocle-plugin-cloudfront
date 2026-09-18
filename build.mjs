@@ -1,7 +1,7 @@
 import { build } from 'esbuild';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 
-import { stripForDeploy } from './strip.mjs';
+import { EDGE_CONTRACT_BANNER, stripForDeploy } from './strip.mjs';
 
 // The CloudFront Function is deployed AS-WRITTEN (src/function/index.js): the
 // runtime has a hard 10 KB source limit and no module system beyond its own
@@ -50,6 +50,16 @@ await build({
 	format: 'cjs',
 	outfile: 'dist/lambda/index.js',
 	external: ['./config.json'],
+	banner: { js: `${EDGE_CONTRACT_BANNER}\n` },
 });
+
+const lambdaSource = readFileSync('dist/lambda/index.js', 'utf8');
+if (!lambdaSource.includes('SignatureV4a')) {
+	console.error(
+		'Lambda bundle is missing the SigV4A signer; CloudFront KVS reads will 503 at the edge. ' +
+			'Keep the `@aws-sdk/signature-v4a` side-effect import in src/lambda/kvs.ts.',
+	);
+	process.exit(1);
+}
 
 console.log(`function: ${functionSize} bytes (limit ${FUNCTION_MAX_BYTES}); lambda: bundled.`);

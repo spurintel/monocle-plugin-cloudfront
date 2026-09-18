@@ -1,9 +1,13 @@
 # Monocle CloudFront Integration
 
-Monocle edge assessment and policy blocking for **Amazon CloudFront**, deployed
-click-to-deploy from the Monocle dashboard into the customer's own AWS account
-(cross-account IAM role). The customer pays AWS for the edge compute, exactly as
-Fastly/Cloudflare customers pay for Compute/Workers.
+Monocle assess/enforce edge protection for **Amazon CloudFront**, deployed click-to-deploy
+from the Monocle dashboard into the customer's own AWS account (cross-account IAM role).
+The customer pays AWS for the edge compute, exactly as Fastly and Cloudflare customers pay
+for Compute and Workers.
+
+The shared contract lives in `@spur.us/monocle-edge-core`; the Cloudflare Worker is the
+reference implementation. This plugin is the CloudFront port of that contract, with the
+differences the platform forces listed below.
 
 ## Architecture
 
@@ -11,80 +15,115 @@ Two runtimes split the work (see `src/`):
 
 | | CloudFront Function (`src/function/index.js`) | Lambda@Edge (`src/lambda/`) |
 |---|---|---|
-| Trigger | viewer-request on every behavior covering protected paths | viewer-request on the dedicated `/__mcl/verify` behavior only |
-| Job | validate the session cookie's HMAC; pass through or serve the interstitial | call the Monocle Policy API; mint the cookie; serve block responses |
-| Cost/latency | sub-millisecond, runs on every request | runs once per session |
+| Trigger | viewer-request on the default behavior and every customer behavior | origin-request on the `/__mcl/*` behaviors only |
+| Job | the guard ladder: host check, path canonicalization, verdict cookie, crawler and allow-list passes, breaker, refusal shells | `/__mcl/state`, `/__mcl/verify` (Policy call and cookie minting), the challenge, resubmit and block pages, the resident script, the hourly crawler refresh |
+| Cost and latency | sub-millisecond, runs on every request | runs only inside the challenge flow |
 
-**Flow**: unverified visitor on a protected path → CloudFront Function serves a
-minimal interstitial → browser runs Monocle (`mcl.js`) → POSTs the assessment to
-`/__mcl/verify` → Lambda@Edge calls the Policy API → allow ⇒ `200` +
-HMAC-signed cookie, deny ⇒ block response → browser reloads → CloudFront
-Function validates the cookie and passes the request straight through to
-**cache/origin untouched**.
+**Flow**: a visitor without a valid decision opens an assessed page. The Function answers
+a 503 shell that navigates to `/__mcl/challenge?return=<path>`. The challenge page runs
+Monocle, POSTs the assessment to `/__mcl/verify`, the Lambda calls the Policy API and mints
+an HMAC-sealed `__Host-mcl_c` cookie (allow one hour, block ten minutes), the page reloads
+the return path, and the Function passes the request through to **cache and origin
+untouched**. Enforced paths refuse a cookieless request by shape (challenge shell, resubmit
+shell, challenge JSON, or an empty 403 for WebSockets) and answer a block verdict with the
+customer's block page, redirect or JSON.
 
-That last property is the point of the split: verified traffic (and every
-unprotected path) keeps CloudFront's edge caching, because a viewer-request
-CloudFront Function can `return request` — unlike Akamai's `responseProvider`,
-which must proxy the origin.
+Verified traffic and every uncovered path keep CloudFront's edge caching, because a
+viewer-request Function can `return request`.
 
 ## Platform constraints this design encodes
 
-Validated against AWS docs (July 2026):
-
 - **CloudFront Functions** ([runtime 2.0](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/functions-javascript-runtime-20.html)):
-  10 KB source limit (`build.mjs` and `test/function.test.ts` enforce it — the
-  file is deployed as-written, no bundler), no network, no request body, crypto
-  is `createHmac`/`createHash` **only** — hence the HMAC cookie scheme shared
-  with `monocle-plugin-fastly`, never AES-GCM (the Cloudflare worker's scheme).
+  10 KB source limit (`build.mjs` and `test/function.test.ts` enforce it on the stripped
+  artifact), no network, no request body, crypto is `createHmac`/`createHash` only. So the
+  cookie seal is HMAC-SHA256 over the edge core's v2 envelope, not AES-GCM, and the
+  challenge page is not inlined: the Function serves a 300-byte shell that navigates to
+  tier two. No injection is possible, so `injection` is always `off` on CloudFront.
 - **Lambda@Edge** ([restrictions](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/lambda-at-edge-function-restrictions.html)):
-  us-east-1 only, numbered versions only, **no environment variables** — config
-  is baked as `config.json` into the deployment zip by the dashboard
-  (`src/lambda/config.ts`). A generated 204 with a body becomes a 502, so the
-  verify success response is a `200`. Request body arrives base64, truncated at
-  40 KB (ample for an assessment).
+  us-east-1 only, numbered versions only, no environment variables. Secrets are baked as
+  `config.json` into the deployment zip; everything a dashboard save can change is read
+  from the KeyValueStore. The origin-request trigger is used because it allows 30 seconds
+  and 1 MB bodies; viewer-request's 5 seconds cannot hold a Policy call.
 - **KeyValueStore** ([quotas](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/cloudfront-limits.html)):
-  values ≤ 1 KB — `protectedPaths` overflows into `protectedPaths.1`, `.2`, …
-  continuation keys. KVS updates apply WITHOUT redeploying, so protected-path
-  edits are instant; block-config edits republish the Lambda.
-- A cache behavior takes **one function per event type**: the CloudFront
-  Function and Lambda@Edge live on different behaviors, and the dashboard
-  pre-flights existing viewer-request associations before deploying.
-- **Free flat-rate-plan distributions cannot attach a KVS-backed CloudFront
-  Function** ([plan feature matrix](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/flat-rate-pricing-plan.html)) —
-  verified live: the attach fails with "You can't associate this CloudFront
-  Function to a distribution on a Free plan tier." Customers need a Pro+ plan
-  or classic pay-as-you-go (cancelling a Free plan takes effect immediately).
-  Lambda@Edge itself is allowed on every tier.
+  values at most 1 KB, so long values chunk into `.1`, `.2`, … continuation keys. Updates
+  apply without redeploying, so path, block-page and policy edits are live within seconds.
+- A cache behavior takes **one function per event type**: the Function and the Lambda
+  live on different behaviors, and the dashboard pre-flights existing viewer-request
+  associations before deploying.
+- **Free flat-rate-plan distributions cannot attach a KVS-backed CloudFront Function**
+  ([plan feature matrix](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/flat-rate-pricing-plan.html)).
+  Customers need a Pro+ plan or classic pay-as-you-go.
 
-## KeyValueStore keys (read by the CloudFront Function)
+## Behaviors the dashboard attaches
 
-| Key | Value |
-|---|---|
-| `cookieSecret` | hex HMAC key (also baked into the Lambda config, which mints) |
-| `publishableKey` | Monocle publishable key for the interstitial script tag |
-| `protectedPaths` | JSON `{ "<host>": ["/pattern*", …] }`, chunked into `.1`, `.2`, … when > 1 KB |
+| Path pattern | Cache policy | Lambda | Purpose |
+|---|---|---|---|
+| `/__mcl/*/mcl.js` | CachingOptimized | origin-request | The resident script for the manual include; cached per segment |
+| `/__mcl/challenge` | CachingOptimized | origin-request | The visible check page; static, reads `return` client-side |
+| `/__mcl/*` | CachingDisabled | origin-request, IncludeBody | state, verify, blocked, resubmit |
+
+All three use the AllViewerExceptHostHeader origin-request policy so the Lambda sees the
+viewer's Origin, Cookie and Sec-Fetch headers.
+
+Session tracking differs from the Worker in one place. The Worker tags the core URL with
+`cpd=<sid>` when it serves the challenge page or resident script; here both are cached and
+identical for every visitor, so `GET /__mcl/state` returns `{hint, degraded, sid}`, mints
+the session cookie when tracking is on and none is held, and the scripts append `cpd`
+themselves before loading the core. The session cookie is attribution only.
+
+## KeyValueStore keys (read by the Function; `cv`, `cfg` and `hosts` by the Lambda too)
+
+| Key | Value | Writer |
+|---|---|---|
+| `v` | `2` | dashboard |
+| `g` | generation the dashboard last wrote | dashboard |
+| `hosts` | JSON array with the lowercase hostname the deployment protects (the dashboard writes one) | dashboard |
+<!-- The Function also acts on `event.context.distributionDomainName`, the distribution's own
+     *.cloudfront.net address: same origin, same config, and the one host a visitor can choose to
+     reach this deployment. It is never written to `hosts`; a deployment still protects one
+     configured hostname. The Lambda already trusts it the same way for the verify Origin check. -->
+| `k`, `kp` | sealing key hex; previous key during rotation | dashboard |
+| `cv` | clearance version, 64 lowercase hex | dashboard |
+| `id` | deployment id, the cookie audience | dashboard |
+| `cfg` | JSON `{session_tracking, block_page, custom_domain}` | dashboard |
+| `ips` | packed `allow_ips` ranges | dashboard |
+| `w` | wildcard-segment patterns `[{p, e}]`, at most 100 | dashboard |
+| `p:<path>` | `e` enforced exact, `a` assessed exact | dashboard |
+| `s:<prefix>` | `e` enforced subtree, `a` assessed subtree | dashboard |
+| `bots` | packed crawler ranges plus `expiresAt` | Lambda, hourly |
+| `brk` | breaker open-until epoch seconds | Lambda, on transition |
+
+Route resolution is a walk: for `/a/b/c` the Function reads `p:/a/b/c`, then `s:/a/b/c`,
+`s:/a/b`, `s:/a`, `s:/`, then scans `w`. Enforcement applies if any `e` matches; assessment
+if any `a` matches. There is no specificity contest between the two, as in the edge core.
 
 ## Lambda `config.json` (baked at deploy)
 
 ```json
 {
 	"secretKey": "<monocle secret key>",
-	"cookieSecret": "<hex hmac key>",
-	"blockResponseType": "html | redirect (optional)",
-	"blockStatusCode": "403",
-	"blockPageTitle": "…",
-	"blockResponseBody": "…",
-	"blockRedirectUrl": "…"
+	"cookieSecret": "<hex sealing key>",
+	"cookieSecretPrevious": "<hex, optional during rotation>",
+	"publishableKey": "<monocle publishable key>",
+	"deploymentId": "<app id>",
+	"kvsArn": "arn:aws:cloudfront::<account>:key-value-store/<id>"
 }
 ```
+
+The Lambda's execution role needs `cloudfront-keyvaluestore:DescribeKeyValueStore`,
+`GetKey` and `UpdateKeys` on that store. An EventBridge Scheduler rule invokes the same
+function hourly with `{"refresh":"crawlers"}` to rewrite `bots`.
 
 ## Develop
 
 ```sh
 npm install
-npm test        # vitest — includes the 10 KB size gate and a cross-implementation
-                # pin: cookies minted by the Lambda code must validate in the
-                # CloudFront Function source (loaded via an eval harness)
-npm run build   # dist/function/index.js (verbatim copy, size-checked)
-                # dist/lambda/index.js  (esbuild CJS bundle for node20)
+npm test        # vitest: the 10 KB size gate, the strict-v3 path corpus run through the
+                # Function, the cross-pin that the Function opens what the Lambda mints,
+                # and the endpoint contract
+npm run build   # dist/function/index.js (stripped, size-checked, contract banner)
+                # dist/lambda/index.js  (esbuild CJS bundle for node20, contract banner)
 ```
+
+Both artifacts begin with `// Monocle edge contract: 2`; the dashboard refuses artifacts
+without it.
