@@ -64,7 +64,7 @@ export function blockPageResponse(runtime: Runtime, method: string): EdgeRespons
 	);
 }
 
-export function blockStatus(runtime: Runtime): number {
+function blockStatus(runtime: Runtime): number {
 	const status = runtime.live.blockPage.status;
 	return status === 401 || status === 404 ? status : 403;
 }

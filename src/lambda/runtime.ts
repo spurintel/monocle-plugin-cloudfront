@@ -2,9 +2,9 @@
 
 import { createHash } from 'node:crypto';
 
-import { COOKIE_SCOPE, type Sealer } from '@spur.us/monocle-edge-core';
+import { COOKIE_SCOPE, RESIDENT_SCRIPT_VERSION, type Sealer } from '@spur.us/monocle-edge-core';
 
-import { DEFAULT_CORE_HOST, KVS_CACHE_MS, SCRIPT_VERSION } from '../shared/constants';
+import { DEFAULT_CORE_HOST, KVS_CACHE_MS } from '../shared/constants';
 import { createHmacSealer } from '../shared/hmac-sealer';
 import type { BakedConfig } from './config';
 import { readChunks } from './kvs';
@@ -42,7 +42,7 @@ let cached:
 	| undefined;
 
 export async function getRuntime(baked: BakedConfig, kvs: Kvs, now = Date.now()): Promise<Runtime> {
-	const identity = `${baked.cookieSecret}|${baked.cookieSecretPrevious ?? ''}|${baked.deploymentId}|${baked.publishableKey}`;
+	const identity = `${baked.cookieSecret}|${baked.deploymentId}|${baked.publishableKey}`;
 	if (cached && cached.identity === identity && now < cached.until) return cached.runtime;
 
 	const cv = (await kvs.get('cv')) ?? '';
@@ -81,7 +81,7 @@ export async function getRuntime(baked: BakedConfig, kvs: Kvs, now = Date.now())
 	const runtime: Runtime = {
 		baked,
 		live,
-		sealer: createHmacSealer(baked.cookieSecret, baked.cookieSecretPrevious),
+		sealer: createHmacSealer(baked.cookieSecret),
 		audience: baked.deploymentId,
 		scope: COOKIE_SCOPE,
 		scriptSegment: deriveScriptSegment(baked.deploymentId, customDomain),
@@ -99,7 +99,7 @@ export async function getRuntime(baked: BakedConfig, kvs: Kvs, now = Date.now())
  */
 export function deriveScriptSegment(deploymentId: string, customDomain = ''): string {
 	return createHash('sha256')
-		.update(`${deploymentId}|${SCRIPT_VERSION}|${customDomain}`)
+		.update(`${deploymentId}|${RESIDENT_SCRIPT_VERSION}|${customDomain}`)
 		.digest('hex')
 		.slice(0, 16);
 }

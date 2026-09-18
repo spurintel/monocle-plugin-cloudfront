@@ -10,8 +10,8 @@ interface BreakerState {
 }
 
 const FAILURE_WINDOW_MS = 60_000;
-export const FAILURE_THRESHOLD = 20;
-export const OPEN_RETRY_MS = 15_000;
+const FAILURE_THRESHOLD = 20;
+const OPEN_RETRY_MS = 15_000;
 const HALF_OPEN_SUCCESSES_TO_CLOSE = 3;
 const PROBE_LEASE_MS = 10_000;
 

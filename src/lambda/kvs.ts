@@ -62,12 +62,13 @@ export async function readChunks(kvs: Kvs, key: string): Promise<string | null> 
 }
 
 /** Continuation keys a reader will follow before giving up. */
-export const MAX_CHUNKS = 128;
+const MAX_CHUNKS = 128;
 
 /**
  * Splits a value across `key`, `key.1`, … and deletes every continuation key the
  * previous value used beyond the new length, so a reader never concatenates a
- * stale tail onto the new value.
+ * stale tail onto the new value. Slices by CODE UNIT, so callers must pass ASCII
+ * (the only caller writes a packed CIDR snapshot).
  */
 export async function writeChunks(kvs: Kvs, key: string, value: string): Promise<void> {
 	const puts: { key: string; value: string }[] = [];

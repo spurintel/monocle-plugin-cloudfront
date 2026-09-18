@@ -1,4 +1,4 @@
-/** HMAC-SHA256 sealer: base64url(plaintext).base64url(hmac). Current key seals; current then previous open. */
+/** HMAC-SHA256 sealer: base64url(plaintext).base64url(hmac). */
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
@@ -21,15 +21,9 @@ function mac(key: Buffer, data: Buffer): Buffer {
 	return createHmac('sha256', key).update(data).digest();
 }
 
-export function createHmacSealer(currentKeyHex: string, previousKeyHex?: string): Sealer {
-	if (
-		!/^[0-9a-fA-F]{64}$/.test(currentKeyHex) ||
-		(previousKeyHex !== undefined && !/^[0-9a-fA-F]{64}$/.test(previousKeyHex))
-	) {
-		throw new Error('Invalid sealing key');
-	}
-	const current = Buffer.from(currentKeyHex, 'hex');
-	const previous = previousKeyHex ? Buffer.from(previousKeyHex, 'hex') : undefined;
+export function createHmacSealer(keyHex: string): Sealer {
+	if (!/^[0-9a-fA-F]{64}$/.test(keyHex)) throw new Error('Invalid sealing key');
+	const current = Buffer.from(keyHex, 'hex');
 	return {
 		async seal(plaintext: string) {
 			const pt = Buffer.from(plaintext, 'utf8');
@@ -42,13 +36,9 @@ export function createHmacSealer(currentKeyHex: string, previousKeyHex?: string)
 			const pt = unb64url(sealed.slice(0, dot));
 			const sig = unb64url(sealed.slice(dot + 1));
 			if (!pt || !sig || sig.length !== 32) return null;
-			for (const key of previous ? [current, previous] : [current]) {
-				const expected = mac(key, pt);
-				if (expected.length === sig.length && timingSafeEqual(expected, sig)) {
-					return pt.toString('utf8');
-				}
-			}
-			return null;
+			const expected = mac(current, pt);
+			if (expected.length !== sig.length || !timingSafeEqual(expected, sig)) return null;
+			return pt.toString('utf8');
 		},
 	};
 }

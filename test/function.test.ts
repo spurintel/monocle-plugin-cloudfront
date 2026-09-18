@@ -94,16 +94,11 @@ function viewerEvent(overrides: {
 	};
 }
 
-async function mintCookie(
-	ip = IP,
-	verdict: 'allow' | 'block' = 'allow',
-	key = SECRET,
-	previous?: string
-) {
+async function mintCookie(ip = IP, verdict: 'allow' | 'block' = 'allow', key = SECRET) {
 	const binding = bindingForm(ip);
 	if (!binding) throw new Error('unbindable');
 	const minted = await mintVerdictCookie({
-		sealer: createHmacSealer(key, previous),
+		sealer: createHmacSealer(key),
 		audience: ID,
 		scope: COOKIE_SCOPE,
 		ipBinding: binding,
@@ -239,10 +234,13 @@ describe('CloudFront Function (viewer-request)', () => {
 		expect(result.statusCode).toBe(503);
 	});
 
-	it('opens a cookie sealed with the previous key during rotation', async () => {
+	// A cookie the store's key cannot open carries no verdict, so an enforced path
+	// challenges rather than passing it through.
+	it('refuses a cookie sealed with a key the store does not hold', async () => {
 		const cookie = await mintCookie(IP, 'allow', PREV);
 		const event = viewerEvent({ uri: '/account', cookie });
-		expect(await loadHandler(baseKv({ 'p:/account': 'e', kp: PREV }))(event)).toBe(event.request);
+		const result = (await loadHandler(baseKv({ 'p:/account': 'e' }))(event)) as FnResponse;
+		expect(result.statusCode).toBe(503);
 	});
 
 	it('answers a block verdict on a navigation with the blocked shell', async () => {

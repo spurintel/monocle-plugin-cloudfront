@@ -16,10 +16,8 @@ describe('createHmacSealer', () => {
 		expect(await sealer.open(sealed)).toBe('hello');
 	});
 
-	it('opens with the previous key after rotation', async () => {
-		const old = createHmacSealer(PREV);
-		const sealed = await old.seal('rotated');
-		expect(await createHmacSealer(SECRET, PREV).open(sealed)).toBe('rotated');
+	it('rejects a payload sealed with another key', async () => {
+		const sealed = await createHmacSealer(PREV).seal('other');
 		expect(await createHmacSealer(SECRET).open(sealed)).toBeNull();
 	});
 

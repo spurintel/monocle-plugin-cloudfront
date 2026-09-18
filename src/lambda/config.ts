@@ -11,7 +11,6 @@ import { join } from 'node:path';
 export interface BakedConfig {
 	secretKey: string;
 	cookieSecret: string;
-	cookieSecretPrevious?: string;
 	publishableKey: string;
 	deploymentId: string;
 	kvsArn: string;
@@ -26,7 +25,3 @@ export function loadConfig(): BakedConfig {
 	return cached;
 }
 
-/** Test hook. */
-export function setConfigForTests(config: BakedConfig | null): void {
-	cached = config;
-}

@@ -78,7 +78,7 @@ export function cookieHeader(headers: EdgeHeaders): string | null {
 }
 
 /** Viewer Host to HTTPS origin, matching how the Function strips a non-IPv6 port. */
-export function requestOrigin(host: string): string {
+function requestOrigin(host: string): string {
 	let name = host.toLowerCase();
 	const colon = name.lastIndexOf(':');
 	if (colon > 0 && name.indexOf(']') === -1) name = name.slice(0, colon);
@@ -86,17 +86,9 @@ export function requestOrigin(host: string): string {
 }
 
 /** Origin-request Host is the origin's domain (S3) unless an origin-request policy forwards the viewer Host. */
-export function isAwsOriginHostname(host: string): boolean {
+function isAwsOriginHostname(host: string): boolean {
 	const name = host.toLowerCase().split(':')[0] ?? '';
 	return name.endsWith('.amazonaws.com');
-}
-
-/** Site origin the browser used: viewer Host, else the distribution domain. */
-export function viewerOrigin(hostHeader: string, distributionDomainName?: string): string {
-	const host = isAwsOriginHostname(hostHeader)
-		? (distributionDomainName ?? hostHeader)
-		: hostHeader || distributionDomainName || '';
-	return requestOrigin(host);
 }
 
 /** CSRF gate for POST /__mcl/verify. `site` is Sec-Fetch-Site, lowercased. */
@@ -117,11 +109,9 @@ export function originHeaderAllowed(
 	} catch {
 		return false;
 	}
-	// A deployment protecting every hostname the distribution serves cannot
-	// enumerate them, so what remains is the browser's own statement that this is
-	// its page calling its own origin - which a cross-site caller cannot truthfully
-	// make, and which a forged header buys nothing with: the cookie minted is bound
-	// to the forger's own IP.
+	// A deployment covering every hostname cannot enumerate them, so the check is
+	// the browser's same-origin statement, which a cross-site caller cannot make.
+	// Forging it buys nothing: the cookie minted is bound to the forger's own IP.
 	if (anyHostname) return site === 'same-origin';
 	return allowedHostnames.includes(hostname);
 }

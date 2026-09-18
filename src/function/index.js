@@ -27,12 +27,9 @@ async function handler(event) {
 		} catch (e) {
 			return req;
 		}
-		// The distribution's own *.cloudfront.net name is the same site by its other
-		// door: same origin, same config, and the only host a visitor can choose
-		// that reaches this deployment. Passing it through would leave an alias
-		// deployment bypassable by anyone who knows the domain. A deployment still
-		// protects ONE configured hostname; this is not a second one. The Lambda
-		// already trusts it the same way when it checks the verify Origin.
+		// The distribution's own *.cloudfront.net name reaches the same origin and
+		// config, so an alias deployment would be bypassable through it. Treated as
+		// the configured host, not a second one; the Lambda's verify Origin agrees.
 		if (!Array.isArray(hosts)) return req;
 		var own = event.context && event.context.distributionDomainName;
 		if (hosts.length && hosts.indexOf(host) === -1 && host !== (own ? own.toLowerCase() : null))
@@ -59,7 +56,6 @@ async function handler(event) {
 		var safe = method === 'GET' || method === 'HEAD';
 		var ip = event.viewer && event.viewer.ip ? event.viewer.ip : '';
 		var bind = binding(ip);
-		var prev = await g(kvs, 'kp');
 		var cv = await g(kvs, 'cv');
 		var id = await g(kvs, 'id');
 		// Without id/cv no cookie can open, so no challenge could ever be passed
@@ -70,7 +66,7 @@ async function handler(event) {
 			req.headers['x-monocle-skip'] = { value: 'no-config' };
 			return req;
 		}
-		var verdict = cookieVal ? openVerdict(cookieVal, [key, prev], id, cv, bind) : null;
+		var verdict = cookieVal ? openVerdict(cookieVal, key, id, cv, bind) : null;
 		if (safe && !ws) {
 			var botsRaw = await readChunks(kvs, 'bots');
 			if (botsRaw && inPacked(ip, botsRaw)) return req;
@@ -215,22 +211,14 @@ function unb64(s) {
 	}
 }
 
-function openVerdict(sealed, keys, aud, cv, bind) {
+function openVerdict(sealed, key, aud, cv, bind) {
 	if (!sealed || sealed.length > 8192 || bind === null) return null;
 	var d = sealed.lastIndexOf('.');
 	if (d < 1) return null;
 	var pt = unb64(sealed.slice(0, d));
 	var sig = sealed.slice(d + 1);
 	if (!pt) return null;
-	var ok = false,
-		i;
-	for (i = 0; i < keys.length; i++) {
-		if (keys[i] && same(b64url(crypto.createHmac('sha256', Buffer.from(keys[i], 'hex')).update(pt).digest()), sig)) {
-			ok = true;
-			break;
-		}
-	}
-	if (!ok) return null;
+	if (!same(b64url(crypto.createHmac('sha256', Buffer.from(key, 'hex')).update(pt).digest()), sig)) return null;
 	var env;
 	try {
 		env = JSON.parse(pt.toString('utf8'));
