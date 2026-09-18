@@ -41,7 +41,10 @@ function viewerEvent(overrides: {
 		request: {
 			method: 'GET',
 			uri: overrides.uri ?? '/account',
-			headers: { host: { value: overrides.host ?? 'www.example.com' } },
+			headers: { host: { value: overrides.host ?? 'www.example.com' } } as Record<
+				string,
+				{ value: string } | undefined
+			>,
 			cookies: overrides.cookie ? { MCLVALID: { value: overrides.cookie } } : {},
 		},
 		viewer: { ip: overrides.ip ?? '203.0.113.9' },
@@ -239,5 +242,77 @@ describe('CloudFront Function (viewer-request)', () => {
 			const result = (await handler(viewerEvent({ uri }))) as FnResponse;
 			expect(result.statusCode).toBe(200);
 		}
+	});
+});
+
+describe('clientIpHeader stamping', () => {
+	const forged = { value: '198.51.100.99' };
+
+	it('overwrites a forged inbound header on the valid-cookie pass-through', async () => {
+		const handler = loadHandler({
+			cookieSecret: SECRET,
+			clientIpHeader: 'X-Spur-Client-IP',
+		});
+		const cookie = mintCookieValue('203.0.113.9', SECRET);
+		const event = viewerEvent({ cookie });
+		event.request.headers['x-spur-client-ip'] = { ...forged };
+
+		const result = await handler(event);
+
+		expect(result).toBe(event.request);
+		expect(event.request.headers['x-spur-client-ip']).toEqual({ value: '203.0.113.9' });
+	});
+
+	it('stamps the unprotected-path pass-through', async () => {
+		const handler = loadHandler({
+			cookieSecret: SECRET,
+			clientIpHeader: 'X-Spur-Client-IP',
+			protectedPaths: JSON.stringify({ 'www.example.com': ['/checkout*'] }),
+		});
+		const event = viewerEvent({ uri: '/about' });
+
+		const result = await handler(event);
+
+		expect(result).toBe(event.request);
+		expect(event.request.headers['x-spur-client-ip']).toEqual({ value: '203.0.113.9' });
+	});
+
+	it('stamps the no-cookie-secret fail-open pass-through', async () => {
+		const handler = loadHandler({ clientIpHeader: 'X-Spur-Client-IP' });
+		const event = viewerEvent({});
+		event.request.headers['x-spur-client-ip'] = { ...forged };
+
+		const result = await handler(event);
+
+		expect(result).toBe(event.request);
+		expect(event.request.headers['x-spur-client-ip']).toEqual({ value: '203.0.113.9' });
+	});
+
+	it('removes a forged inbound header when no viewer IP is available', async () => {
+		const handler = loadHandler({
+			cookieSecret: SECRET,
+			clientIpHeader: 'X-Spur-Client-IP',
+		});
+		const cookie = mintCookieValue('', SECRET);
+		const event = viewerEvent({ cookie });
+		(event as { viewer: { ip?: string } }).viewer.ip = undefined;
+		event.request.headers['x-spur-client-ip'] = { ...forged };
+
+		const result = await handler(event);
+
+		expect(result).toBe(event.request);
+		expect(event.request.headers['x-spur-client-ip']).toBeUndefined();
+	});
+
+	it('touches nothing when the KVS entry is absent', async () => {
+		const handler = loadHandler({ cookieSecret: SECRET });
+		const cookie = mintCookieValue('203.0.113.9', SECRET);
+		const event = viewerEvent({ cookie });
+		event.request.headers['x-spur-client-ip'] = { ...forged };
+
+		const result = await handler(event);
+
+		expect(result).toBe(event.request);
+		expect(event.request.headers['x-spur-client-ip']).toEqual(forged);
 	});
 });
