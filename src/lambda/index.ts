@@ -11,7 +11,7 @@ import { handleMclEndpoint } from './endpoints';
 import { edgeResponse, jsonResponse, toHeaders } from './http';
 import { createKvs } from './kvs';
 import { getRuntime } from './runtime';
-import { unavailablePage } from './templates';
+import { unavailablePage } from '@spur.us/monocle-edge-core';
 import type { CloudFrontOriginRequestEvent, EdgeResponse, Kvs } from './types';
 
 export interface HandlerDeps {

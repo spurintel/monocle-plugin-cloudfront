@@ -13,16 +13,15 @@ import {
 	validateVerdictCookie,
 	type Verdict,
 	type VerdictState,
-} from '@spur.us/monocle-edge-core';
-
-import { MAX_VERIFY_BODY_BYTES, SCRIPT_CACHE_SECONDS } from '../shared/constants';
-import {
 	breakerOpen,
 	breakerOpenUntil,
 	recordPolicyFailure,
 	recordPolicySuccess,
 	takeAvailabilityProbe,
-} from './breaker';
+	residentScript,
+} from '@spur.us/monocle-edge-core';
+
+import { MAX_VERIFY_BODY_BYTES, SCRIPT_CACHE_SECONDS } from '../shared/constants';
 import {
 	cookieHeader,
 	edgeResponse,
@@ -33,7 +32,6 @@ import {
 	toHeaders,
 } from './http';
 import type { Kvs } from './types';
-import { residentScript } from './resident-script';
 import { blockPageResponse, coreUrlFor, interstitialResponse, resubmitResponse } from './responses';
 import type { Runtime } from './runtime';
 import type { EdgeRequest, EdgeResponse } from './types';

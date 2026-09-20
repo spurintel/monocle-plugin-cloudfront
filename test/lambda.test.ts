@@ -3,11 +3,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	COOKIE_SCOPE,
 	evaluateForEdge,
+	OPEN_GRACE_MS,
 	packCidrSet,
+	recordPolicyFailure,
+	resetBreaker,
+	safeReturn,
 	validateVerdictCookie,
 } from '@spur.us/monocle-edge-core';
 
-import { OPEN_GRACE_MS, recordPolicyFailure, resetBreaker } from '../src/lambda/breaker';
 import { resetPersistedBreaker } from '../src/lambda/endpoints';
 import type { BakedConfig } from '../src/lambda/config';
 import { CRAWLER_FEEDS, refreshCrawlerRanges } from '../src/lambda/crawler';
@@ -15,7 +18,6 @@ import { handleOriginRequest, handler } from '../src/lambda/index';
 import { MemoryKvs, readChunks, writeChunks } from '../src/lambda/kvs';
 import { deriveScriptSegment, resetRuntimeCache } from '../src/lambda/runtime';
 import { createHmacSealer } from '../src/shared/hmac-sealer';
-import { safeReturn } from '../src/lambda/templates';
 
 const SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 const CV = 'ab'.repeat(32);

@@ -3,7 +3,7 @@
 import { SCRIPT_CACHE_SECONDS } from '../shared/constants';
 import { REFUSAL_HEADERS, edgeResponse, toHeaders } from './http';
 import type { Runtime } from './runtime';
-import { blockPage, interstitialPage, resubmitPage, unavailablePage } from './templates';
+import { blockPage, interstitialPage, resubmitPage, unavailablePage } from '@spur.us/monocle-edge-core';
 import type { EdgeResponse } from './types';
 
 export function coreUrlFor(coreScriptUrl: string, sid?: string): string {
@@ -39,7 +39,7 @@ export function interstitialResponse(
 	return edgeResponse(
 		status,
 		toHeaders(headers),
-		method === 'HEAD' ? null : interstitialPage(coreUrlFor(runtime.coreScriptUrl))
+		method === 'HEAD' ? null : interstitialPage({ coreUrl: coreUrlFor(runtime.coreScriptUrl) })
 	);
 }
 
