@@ -5,18 +5,17 @@ import {
 	evaluateForEdge,
 	OPEN_GRACE_MS,
 	packCidrSet,
-	recordPolicyFailure,
-	resetBreaker,
 	safeReturn,
+	scriptSegment,
 	validateVerdictCookie,
 } from '@spur.us/monocle-edge-core';
 
-import { resetPersistedBreaker } from '../src/lambda/endpoints';
+import { persistingBreaker, resetBreaker } from '../src/lambda/breaker';
 import type { BakedConfig } from '../src/lambda/config';
 import { CRAWLER_FEEDS, refreshCrawlerRanges } from '../src/lambda/crawler';
 import { handleOriginRequest, handler } from '../src/lambda/index';
 import { MemoryKvs, readChunks, writeChunks } from '../src/lambda/kvs';
-import { deriveScriptSegment, resetRuntimeCache } from '../src/lambda/runtime';
+import { resetRuntimeCache } from '../src/lambda/runtime';
 import { createHmacSealer } from '../src/shared/hmac-sealer';
 
 const SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
@@ -129,7 +128,6 @@ afterEach(() => {
 	vi.restoreAllMocks();
 	resetRuntimeCache();
 	resetBreaker();
-	resetPersistedBreaker();
 });
 
 describe('handleOriginRequest /__mcl/*', () => {
@@ -317,7 +315,7 @@ describe('handleOriginRequest /__mcl/*', () => {
 		expect(blocked.body).toContain('Nope');
 		expect(blocked.body).toContain('Denied');
 		// The segment depends on the deployment and core host only, never the block page.
-		const segment = deriveScriptSegment(ID);
+		const segment = await scriptSegment(ID);
 		const script = await handleOriginRequest(
 			originEvent({ uri: `/__mcl/${segment}/mcl.js`, method: 'GET' }),
 			{ config: BAKED, kvs }
@@ -392,7 +390,7 @@ describe('fixes from the audit', () => {
 		const verify = () =>
 			handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), { config: BAKED, kvs });
 		// Open the breaker from the outside; the next failure would write anyway.
-		for (let i = 0; i < 19; i++) recordPolicyFailure();
+		for (let i = 0; i < 19; i++) await persistingBreaker(kvs).recordFailure();
 		await verify();
 		expect(kvs.store.brk).toBeDefined();
 		expect(Number(kvs.store.brk)).toBeGreaterThan(Math.floor(Date.now() / 1000));
@@ -454,7 +452,7 @@ describe('session tracking', () => {
 	it('the resident script and challenge page tag the core URL with cpd client-side', async () => {
 		const kvs = liveKvs();
 		const script = await handleOriginRequest(
-			originEvent({ uri: `/__mcl/${deriveScriptSegment(ID)}/mcl.js`, method: 'GET' }),
+			originEvent({ uri: `/__mcl/${await scriptSegment(ID)}/mcl.js`, method: 'GET' }),
 			{ config: BAKED, kvs }
 		);
 		expect(script.body).toContain("'&cpd='");

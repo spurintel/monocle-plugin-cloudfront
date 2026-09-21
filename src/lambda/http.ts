@@ -1,4 +1,6 @@
-import type { EdgeHeaders, EdgeResponse } from './types';
+/** CloudFront event shapes to and from the Fetch API the shared endpoints speak. */
+
+import type { EdgeHeaders, EdgeRequest, EdgeResponse } from './types';
 
 const STATUS_TEXT: Record<string, string> = {
 	'200': 'OK',
@@ -71,47 +73,39 @@ export function headerValue(headers: EdgeHeaders, name: string): string | undefi
 	return headers[name.toLowerCase()]?.[0]?.value;
 }
 
-export function cookieHeader(headers: EdgeHeaders): string | null {
-	const values = headers.cookie;
-	if (!values?.length) return null;
-	return values.map((h) => h.value).join('; ');
-}
-
-/** Viewer Host to HTTPS origin, matching how the Function strips a non-IPv6 port. */
-function requestOrigin(host: string): string {
-	let name = host.toLowerCase();
-	const colon = name.lastIndexOf(':');
-	if (colon > 0 && name.indexOf(']') === -1) name = name.slice(0, colon);
-	return `https://${name}`;
-}
-
-/** Origin-request Host is the origin's domain (S3) unless an origin-request policy forwards the viewer Host. */
-function isAwsOriginHostname(host: string): boolean {
-	const name = host.toLowerCase().split(':')[0] ?? '';
-	return name.endsWith('.amazonaws.com');
-}
-
-/** CSRF gate for POST /__mcl/verify. `site` is Sec-Fetch-Site, lowercased. */
-export function originHeaderAllowed(
-	originHeader: string | undefined,
-	site: string,
-	allowedHostnames: string[],
-	/** True when the deployment names no hostname, so there is no list to match. */
-	anyHostname = false
-): boolean {
-	if (site === 'cross-site' || site === 'same-site') return false;
-	if (!originHeader) return false;
-	let hostname: string;
-	try {
-		const url = new URL(originHeader);
-		if (url.protocol !== 'https:') return false;
-		hostname = url.hostname.toLowerCase();
-	} catch {
-		return false;
+/** The viewer's request as a Fetch API Request. `host` is only for the URL; nothing routes on it. */
+export function toRequest(request: EdgeRequest, host: string): Request {
+	const headers = new Headers();
+	for (const [name, values] of Object.entries(request.headers)) {
+		// CloudFront may split cookies into several entries; a Cookie header joins with `; `.
+		if (name === 'cookie') headers.set('Cookie', values.map((h) => h.value).join('; '));
+		else for (const header of values) headers.append(header.key ?? name, header.value);
 	}
-	// A deployment covering every hostname cannot enumerate them, so the check is
-	// the browser's same-origin statement, which a cross-site caller cannot make.
-	// Forging it buys nothing: the cookie minted is bound to the forger's own IP.
-	if (anyHostname) return site === 'same-origin';
-	return allowedHostnames.includes(hostname);
+	const method = (request.method || 'GET').toUpperCase();
+	const body =
+		request.body?.data !== undefined && method !== 'GET' && method !== 'HEAD'
+			? Buffer.from(request.body.data, request.body.encoding === 'base64' ? 'base64' : 'utf8')
+			: undefined;
+	const query = request.querystring ? `?${request.querystring}` : '';
+	return new Request(`https://${host}${request.uri}${query}`, { method, headers, body });
+}
+
+/** A Fetch API Response as a CloudFront generated response. */
+export async function fromResponse(response: Response): Promise<EdgeResponse> {
+	const headers: EdgeHeaders = {};
+	response.headers.forEach((value, name) => {
+		if (name !== 'set-cookie') headers[name] = [{ key: headerKey(name), value }];
+	});
+	for (const value of response.headers.getSetCookie()) {
+		(headers['set-cookie'] ??= []).push({ key: 'Set-Cookie', value });
+	}
+	const body = await response.text();
+	return edgeResponse(response.status, headers, body.length ? body : null);
+}
+
+function headerKey(name: string): string {
+	return name
+		.split('-')
+		.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+		.join('-');
 }
