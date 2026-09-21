@@ -13,7 +13,7 @@
 	"dependencies": {
 		"@aws-sdk/client-cloudfront-keyvaluestore": "^3.899.0",
 		"@aws-sdk/signature-v4a": "^3.1111.0",
-		"@spur.us/monocle-edge-core": "github:spurintel/monocle-edge-core#v0.7.0"
+		"@spur.us/monocle-edge-core": "github:spurintel/monocle-edge-core#v0.7.1"
 	},
 	"devDependencies": {
 		"@types/node": "^22.0.0",
