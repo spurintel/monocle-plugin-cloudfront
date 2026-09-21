@@ -1,17 +1,25 @@
 /**
- * Lambda@Edge origin-request handler for `/__mcl/*`, plus the hourly crawler
- * refresh when EventBridge Scheduler invokes the same function in us-east-1.
+ * Lambda@Edge origin-request handler for `/__mcl/*`, plus the hourly crawler refresh when
+ * EventBridge Scheduler invokes the same function in us-east-1. The endpoints are edge-core's;
+ * this file converts CloudFront's event shapes and supplies the platform pieces.
  */
 
-import { bindingForm, canonicalizePath, InvalidPathError, isMclPath } from '@spur.us/monocle-edge-core';
+import {
+	bindingForm,
+	canonicalizePath,
+	handleMclEndpoint,
+	InvalidPathError,
+	isMclPath,
+	unavailablePage,
+} from '@spur.us/monocle-edge-core';
 
+import { SCRIPT_CACHE_SECONDS } from '../shared/constants';
+import { persistingBreaker } from './breaker';
 import { loadConfig, type BakedConfig } from './config';
 import { refreshCrawlerRanges } from './crawler';
-import { handleMclEndpoint } from './endpoints';
-import { edgeResponse, jsonResponse, toHeaders } from './http';
+import { edgeResponse, fromResponse, headerValue, jsonResponse, toHeaders, toRequest } from './http';
 import { createKvs } from './kvs';
 import { getRuntime } from './runtime';
-import { unavailablePage } from '@spur.us/monocle-edge-core';
 import type { CloudFrontOriginRequestEvent, EdgeResponse, Kvs } from './types';
 
 export interface HandlerDeps {
@@ -60,7 +68,8 @@ export async function handleOriginRequest(
 ): Promise<EdgeResponse> {
 	const config = deps?.config ?? loadConfig();
 	const kvs = deps?.kvs ?? createKvs(config.kvsArn);
-	const request = event.Records[0]?.cf.request;
+	const record = event.Records[0];
+	const request = record?.cf.request;
 	if (!request) return jsonResponse({ error: 'invalid' }, 400);
 
 	let canonicalPath: string;
@@ -76,19 +85,32 @@ export async function handleOriginRequest(
 	if (!isMclPath(canonicalPath)) {
 		return jsonResponse({ error: 'not_found' }, 404);
 	}
+	// A body CloudFront truncated is never handed to verify: a fragment would parse as a bad bundle.
+	if (request.body?.inputTruncated) return jsonResponse({ error: 'invalid' }, 413);
 
 	const runtime = await getRuntime(config, kvs);
 	const connectingIp = request.clientIp || null;
-	return handleMclEndpoint({
+	const distributionDomain = record.cf.config?.distributionDomainName?.toLowerCase();
+	// The deployment's hosts, plus the distribution's own domain. Never the origin-request Host,
+	// which names the customer's origin, not a viewer host. A deployment naming no hostname has
+	// no list to match, so the browser's same-origin statement stands in.
+	const allowedOrigins =
+		runtime.live.hosts.length === 0
+			? 'same-origin'
+			: [...runtime.live.hosts, ...(distributionDomain ? [distributionDomain] : [])];
+	const viewerRequest = toRequest(request, distributionDomain ?? headerValue(request.headers, 'host') ?? 'localhost');
+	const response = await handleMclEndpoint(canonicalPath, {
 		runtime,
-		kvs,
-		request,
+		// The challenge page and the resident script sit in the CloudFront cache, so they are
+		// the shared kind: the session tag comes from /__mcl/state.
+		platform: { breaker: persistingBreaker(kvs), sharedPages: { maxAgeSeconds: SCRIPT_CACHE_SECONDS } },
+		request: viewerRequest,
+		url: new URL(viewerRequest.url),
 		connectingIp,
 		ipBinding: connectingIp ? bindingForm(connectingIp) : null,
-		distributionDomainName: event.Records[0]?.cf.config?.distributionDomainName,
-		canonicalPath,
+		allowedOrigins,
 	});
+	return fromResponse(response);
 }
 
-export { handleMclEndpoint };
 export type { BakedConfig };

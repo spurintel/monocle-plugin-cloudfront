@@ -1,48 +1,40 @@
-/** Compile baked secrets with the live KVS config, cached per container. */
+/** Baked secrets and the live KVS config as the endpoint runtime, cached per container. */
 
-import { createHash } from 'node:crypto';
+import {
+	BLOCK_STATUSES,
+	COOKIE_SCOPE,
+	coreScriptUrl,
+	DEFAULT_CORE_HOST,
+	scriptSegment,
+	type BlockPageConfig,
+	type BlockStatus,
+	type EndpointRuntime,
+} from '@spur.us/monocle-edge-core';
 
-import { COOKIE_SCOPE, RESIDENT_SCRIPT_VERSION, type Sealer } from '@spur.us/monocle-edge-core';
-
-import { DEFAULT_CORE_HOST, KVS_CACHE_MS } from '../shared/constants';
+import { KVS_CACHE_MS } from '../shared/constants';
 import { createHmacSealer } from '../shared/hmac-sealer';
 import type { BakedConfig } from './config';
 import { readChunks } from './kvs';
 import type { Kvs } from './types';
 
-export interface BlockPageLive {
-	title?: string;
-	message?: string;
-	status?: number;
-	redirect?: string;
-}
-
 export interface LiveConfig {
 	sessionTracking: boolean;
-	blockPage: BlockPageLive;
+	blockPage: BlockPageConfig | undefined;
 	customDomain?: string;
 	clearanceVersion: string;
 	cfgRaw: string;
 	hosts: string[];
 }
 
-export interface Runtime {
+export interface Runtime extends EndpointRuntime {
 	baked: BakedConfig;
 	live: LiveConfig;
-	sealer: Sealer;
-	audience: string;
-	scope: typeof COOKIE_SCOPE;
-	scriptSegment: string;
-	coreHost: string;
-	coreScriptUrl: string;
 }
 
-let cached:
-	| { until: number; identity: string; runtime: Runtime }
-	| undefined;
+let cached: { until: number; identity: string; runtime: Runtime } | undefined;
 
 export async function getRuntime(baked: BakedConfig, kvs: Kvs, now = Date.now()): Promise<Runtime> {
-	const identity = `${baked.cookieSecret}|${baked.deploymentId}|${baked.publishableKey}`;
+	const identity = `${baked.cookieSecret}|${baked.deploymentId}|${baked.publishableKey}|${baked.secretKey}`;
 	if (cached && cached.identity === identity && now < cached.until) return cached.runtime;
 
 	const cv = (await kvs.get('cv')) ?? '';
@@ -63,15 +55,11 @@ export async function getRuntime(baked: BakedConfig, kvs: Kvs, now = Date.now())
 	} catch {
 		hosts = [];
 	}
-	const blockPage =
-		parsed.block_page && typeof parsed.block_page === 'object'
-			? (parsed.block_page as BlockPageLive)
-			: {};
 	const customDomain =
 		typeof parsed.custom_domain === 'string' && parsed.custom_domain ? parsed.custom_domain : undefined;
 	const live: LiveConfig = {
 		sessionTracking: parsed.session_tracking === 'session' || parsed.session_tracking === true,
-		blockPage,
+		blockPage: blockPageOf(parsed.block_page),
 		customDomain,
 		clearanceVersion: cv,
 		cfgRaw,
@@ -83,25 +71,34 @@ export async function getRuntime(baked: BakedConfig, kvs: Kvs, now = Date.now())
 		live,
 		sealer: createHmacSealer(baked.cookieSecret),
 		audience: baked.deploymentId,
+		clearanceVersion: cv,
 		scope: COOKIE_SCOPE,
-		scriptSegment: deriveScriptSegment(baked.deploymentId, customDomain),
+		secretKey: baked.secretKey,
+		sessionTracking: live.sessionTracking,
+		blockPage: live.blockPage,
+		// The Function cannot inject, so the resident script never carries a redirect target.
+		blockAsyncRedirect: false,
 		coreHost,
-		coreScriptUrl: `https://${coreHost}/d/mcl.js?tk=${encodeURIComponent(baked.publishableKey)}`,
+		coreScriptUrl: coreScriptUrl(coreHost, baked.publishableKey),
+		scriptSegment: await scriptSegment(baked.deploymentId, customDomain),
 	};
 	cached = { until: now + KVS_CACHE_MS, identity, runtime };
 	return runtime;
 }
 
-/**
- * The resident script's URL segment: only what its content depends on, so a
- * block-page edit never rotates a tag the customer has embedded. The dashboard
- * computes the same value for the manual-include snippet.
- */
-export function deriveScriptSegment(deploymentId: string, customDomain = ''): string {
-	return createHash('sha256')
-		.update(`${deploymentId}|${RESIDENT_SCRIPT_VERSION}|${customDomain}`)
-		.digest('hex')
-		.slice(0, 16);
+/** The dashboard's `cfg.block_page`, in the shape the shared pages read. Anything else is the default page. */
+function blockPageOf(raw: unknown): BlockPageConfig | undefined {
+	if (!raw || typeof raw !== 'object') return undefined;
+	const page = raw as { title?: unknown; message?: unknown; status?: unknown; redirect?: unknown };
+	if (typeof page.redirect === 'string' && page.redirect) return { redirect: page.redirect };
+	const status = (BLOCK_STATUSES as readonly number[]).includes(page.status as number)
+		? (page.status as BlockStatus)
+		: undefined;
+	return {
+		title: typeof page.title === 'string' ? page.title : '',
+		message: typeof page.message === 'string' ? page.message : '',
+		status,
+	};
 }
 
 export function resetRuntimeCache(): void {
