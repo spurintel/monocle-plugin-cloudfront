@@ -446,4 +446,68 @@ describe('CloudFront Function (viewer-request)', () => {
 			}
 		}
 	});
+
+	// The canonical path is lower-cased and slash-trimmed for comparison only.
+	// Returning the visitor to it 404s on any case-sensitive origin.
+	it('returns the visitor to the URI they asked for, not its folded form', async () => {
+		const handler = loadHandler(baseKv());
+		const result = (await handler(viewerEvent({ uri: '/Account/Profile/' }))) as FnResponse;
+		expect(result.statusCode).toBe(503);
+		expect(result.body).toContain(encodeURIComponent('/Account/Profile/'));
+	});
+
+	// Buffer.from is lenient, so a truncated key verifies as a DIFFERENT key and
+	// rejects every cookie the Lambda minted: a challenge loop with no way out.
+	it('passes traffic marked when the sealing key is not a 64-hex secret', async () => {
+		for (const bad of [SECRET.slice(0, 63), 'not-hex', '']) {
+			const handler = loadHandler(baseKv({ k: bad }));
+			const result = (await handler(viewerEvent({ uri: '/page' }))) as FnResponse;
+			expect(result.statusCode, JSON.stringify(bad)).toBeUndefined();
+		}
+	});
+
+	// A fail-open return must not hand the origin headers or cookies the viewer set.
+	it('strips contract headers and our cookies even when it fails open', async () => {
+		const handler = loadHandler(baseKv({ k: '' }));
+		const event = viewerEvent({ uri: '/page' });
+		event.request.headers['x-monocle-skip'] = { value: 'spoofed' };
+		event.request.cookies = { '__Host-mcl_c': { value: 'forged' } };
+		const result = (await handler(event)) as { headers?: Record<string, unknown>; cookies?: Record<string, unknown> };
+		expect(result.headers?.['x-monocle-skip']).toBeUndefined();
+		expect(result.cookies?.['__Host-mcl_c']).toBeUndefined();
+	});
+
+	describe('the block page redirect', () => {
+		// The block page is only reached on an enforced route.
+		const blocked = async (redirect: string, extra: Record<string, string> = {}) => {
+			const cookie = await mintCookie(IP, 'block');
+			const handler = loadHandler(
+				baseKv({
+					's:/members': 'e',
+					cfg: JSON.stringify({ block_page: { status: 403, redirect } }),
+					...extra,
+				})
+			);
+			return (await handler(viewerEvent({ uri: '/members/area', cookie }))) as FnResponse;
+		};
+
+		it('redirects to a path on this host', async () => {
+			const result = await blocked('/denied');
+			expect(result.statusCode).toBe(307);
+			expect(result.headers?.location?.value).toBe('/denied');
+		});
+
+		// A browser folds the backslash to a slash, so this leaves the site.
+		it('refuses a target a browser would resolve off-site', async () => {
+			const result = await blocked('/\\evil.example');
+			expect(result.statusCode).toBe(403);
+		});
+
+		// Blocking the block page redirects it to itself, for ever.
+		it('refuses a target inside an enforced subtree', async () => {
+			const result = await blocked('/members/denied');
+			expect(result.statusCode).toBe(403);
+			expect(result.headers?.location).toBeUndefined();
+		});
+	});
 });

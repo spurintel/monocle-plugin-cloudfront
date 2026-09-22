@@ -21,7 +21,13 @@ let cached: BakedConfig | null = null;
 export function loadConfig(): BakedConfig {
 	if (cached) return cached;
 	const raw = readFileSync(join(__dirname, 'config.json'), 'utf8');
-	cached = JSON.parse(raw) as BakedConfig;
+	try {
+		cached = JSON.parse(raw) as BakedConfig;
+	} catch {
+		// V8 quotes the input it choked on, and this file holds the secret key.
+		// These logs land in the customer's account.
+		throw new Error('Monocle config.json is not valid JSON');
+	}
 	return cached;
 }
 

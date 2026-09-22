@@ -36,13 +36,17 @@ function isOriginRequest(event: unknown): event is CloudFrontOriginRequestEvent 
 }
 
 export async function handler(event: unknown, deps?: HandlerDeps): Promise<EdgeResponse | { ok: true }> {
+	// The schedule's own retry and dead-letter handling are the only thing watching
+	// the refresh, and they read a returned value as success. A refresh that failed
+	// must therefore fail the invocation: a snapshot silently left to expire stops
+	// exempting search engines a day later, with nothing logged to say why.
+	if (isCrawlerRefresh(event)) {
+		const config = deps?.config ?? loadConfig();
+		const kvs = deps?.kvs ?? createKvs(config.kvsArn);
+		await refreshCrawlerRanges(kvs);
+		return { ok: true };
+	}
 	try {
-		if (isCrawlerRefresh(event)) {
-			const config = deps?.config ?? loadConfig();
-			const kvs = deps?.kvs ?? createKvs(config.kvsArn);
-			await refreshCrawlerRanges(kvs);
-			return { ok: true };
-		}
 		if (!isOriginRequest(event)) {
 			console.error('Monocle Lambda received an unknown event shape');
 			return jsonResponse({ error: 'invalid' }, 400);

@@ -28,6 +28,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Typecheck
+        # esbuild strips types and vitest transpiles without checking them, so
+        # without this nothing in CI ever type-checks the source.
+        run: npm run typecheck
+
       - name: Test
         run: npm test
 
