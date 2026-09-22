@@ -21,16 +21,24 @@ async function handler(event) {
 		// No host check: CloudFront routes on the Host, so every one that arrives is
 		// a name this distribution serves. An alias the deployment does not list, or
 		// the *.cloudfront.net name, reaches the same origin and is the same site.
-		var path;
+		var paths;
 		try {
-			path = canon(uri);
+			paths = readings(uri);
 		} catch (e) {
 			return resp(400, H('text/plain; charset=utf-8'), '');
 		}
-		if (path === '/__mcl' || path.indexOf('/__mcl/') === 0) return resp(404, H(), null);
+		// Each reading an origin might serve is resolved and the strictest stands:
+		// enforced if any is, an infrastructure pass only if all are.
+		var hit = null,
+			inf = true;
+		for (var i = 0; i < paths.length; i++) {
+			if (paths[i] === '/__mcl' || paths[i].indexOf('/__mcl/') === 0) return resp(404, H(), null);
+			var h = await resolve(kvs, paths[i]);
+			if (h === 'e' || !hit) hit = h;
+			if (!infra(paths[i])) inf = false;
+		}
 		var ck = held && held.multiValue && held.multiValue.length > 1 ? null : held;
 		var cookieVal = ck ? ck.value : '';
-		var hit = await resolve(kvs, path);
 		if (!hit) return req;
 		var method = (req.method || 'GET').toUpperCase();
 		var hd = req.headers;
@@ -52,7 +60,7 @@ async function handler(event) {
 		if (safe && !ws) {
 			var botsRaw = await readChunks(kvs, 'bots');
 			if (botsRaw && inPacked(ip, botsRaw)) return req;
-			if (hit !== 'e' && infra(path)) return req;
+			if (hit !== 'e' && inf) return req;
 		}
 		// No preflight pass, unlike edge-core, which returns only a preflight's
 		// headers. A viewer-request Function cannot drop the origin's body, so an
@@ -117,38 +125,82 @@ function strip(req) {
 	for (var c in req.cookies) if (c.indexOf('__Host-mcl_') === 0) delete req.cookies[c];
 }
 
-// True when an escape stands for an ASCII character we must not accept encoded:
-// one that changes how the path parses, one that could meet a wildcard segment,
-// or an unreserved one, where the escape is a second spelling of the literal.
-// Mirrors edge-core's canonicalizePath; the shared corpus pins them together.
-function aliased(raw) {
-	var re = /%([0-9a-f]{2})/gi,
-		m;
-	while ((m = re.exec(raw))) {
-		var code = parseInt(m[1], 16);
-		if (code <= 0x1f || code === 0x7f) return true;
-		var ch = String.fromCharCode(code);
-		if ('/\\?#;%*'.indexOf(ch) !== -1 || /[A-Za-z0-9\-._~]/.test(ch)) return true;
+// Every path an origin might take the request path to mean: decoded up to twice,
+// with `;params` kept or dropped, slashes merged or not, dot segments resolved or
+// not, cut at a decoded `?` or `#` or not. Mirrors edge-core's pathReadings; the
+// shared corpus pins them together. Throws for what no ordinary client sends.
+function readings(raw) {
+	if (typeof raw !== 'string' || Buffer.byteLength(raw, 'utf8') > 8192 || raw.charAt(0) !== '/' || /[\\\x00-\x1f\x7f?#]/.test(raw))
+		throw 1;
+	var forms = [],
+		form = raw,
+		depth = 0,
+		d;
+	while (/%[0-9a-f]{2}/i.test(form)) {
+		if (depth === 2) throw 1;
+		try {
+			d = form.replace(/(?:%[0-9a-f]{2})+/gi, decodeURIComponent);
+		} catch (e) {
+			if (depth === 0) throw 1;
+			break;
+		}
+		if (/%(?:2f|5c|3b|3f|23|25|2e)/i.test(form)) forms.push(form);
+		form = d;
+		depth++;
 	}
-	return false;
+	forms.push(form);
+	var out = [],
+		list,
+		i,
+		j,
+		f;
+	for (i = 0; i < forms.length; i++) {
+		if (/[\x00-\x1f\x7f]/.test(forms[i])) throw 1;
+		list = vary([forms[i]], /[?#]/, function (p) {
+			return p.replace(/[?#].*$/, '');
+		});
+		list = vary(list, /;/, function (p) {
+			return p
+				.split('/')
+				.map(function (s) {
+					return s.split(';')[0];
+				})
+				.join('/');
+		});
+		list = vary(list, /\/\/|\\/, function (p) {
+			return p.replace(/[\\/]+/g, '/');
+		});
+		list = vary(list, /\/\.\.?(?:\/|$)/, dots);
+		for (j = 0; j < list.length; j++) {
+			f = (list[j] || '/').replace(/[A-Z]+/g, function (s) {
+				return s.toLowerCase();
+			});
+			if (f.length > 1 && f.charAt(f.length - 1) === '/') f = f.slice(0, -1);
+			if (out.indexOf(f) === -1) out.push(f);
+		}
+	}
+	return out;
 }
 
-function canon(raw) {
-	if (typeof raw !== 'string' || Buffer.byteLength(raw, 'utf8') > 8192 || raw.charAt(0) !== '/' || /[\\\x00-\x1f\x7f?#;]/.test(raw))
-		throw 1;
-	var d;
-	try {
-		d = decodeURIComponent(raw);
-	} catch (e) {
-		throw 1;
+function vary(list, test, alt) {
+	var r = [],
+		i;
+	for (i = 0; i < list.length; i++) {
+		r.push(list[i]);
+		if (test.test(list[i])) r.push(alt(list[i]));
 	}
-	if (aliased(raw) || /[\\\x00-\x1f\x7f?#;%]/.test(d) || d.indexOf('//') !== -1) throw 1;
-	var segs = d.split('/');
-	for (var i = 1; i < segs.length; i++) if (segs[i] === '.' || segs[i] === '..') throw 1;
-	var f = d.replace(/[A-Z]+/g, function (s) {
-		return s.toLowerCase();
-	});
-	return f.length > 1 && f.charAt(f.length - 1) === '/' ? f.slice(0, -1) : f;
+	return r;
+}
+
+function dots(p) {
+	var kept = [],
+		s = p.slice(1).split('/'),
+		i;
+	for (i = 0; i < s.length; i++) {
+		if (s[i] === '..') kept.pop();
+		else if (s[i] !== '.') kept.push(s[i]);
+	}
+	return '/' + kept.join('/');
 }
 
 async function resolve(kvs, path) {
@@ -433,14 +485,17 @@ function refuse(req, method, nav, ws, safe, uri) {
 async function redirectable(kvs, to) {
 	if (typeof to !== 'string' || to.charAt(0) !== '/' || to.indexOf('//') === 0) return false;
 	if (/[\\\x00-\x20]/.test(to) || to === '/__mcl' || to.indexOf('/__mcl/') === 0) return false;
-	var target;
+	var targets;
 	try {
-		target = canon(to);
+		targets = readings(to);
 	} catch (e) {
 		return false;
 	}
-	var hit = await resolve(kvs, target);
-	return hit !== 'e';
+	for (var i = 0; i < targets.length; i++) {
+		var hit = await resolve(kvs, targets[i]);
+		if (hit === 'e') return false;
+	}
+	return true;
 }
 
 async function blockResp(kvs, req, nav, method) {

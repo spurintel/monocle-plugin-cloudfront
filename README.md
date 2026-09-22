@@ -16,7 +16,7 @@ Two runtimes split the work (see `src/`):
 | | CloudFront Function (`src/function/index.js`) | Lambda@Edge (`src/lambda/`) |
 |---|---|---|
 | Trigger | viewer-request on the default behavior and every customer behavior | origin-request on the `/__mcl/*` behaviors only |
-| Job | the guard ladder: path canonicalization, verdict cookie, crawler and allow-list passes, breaker, refusal shells | `/__mcl/state`, `/__mcl/verify` (Policy call and cookie minting), the challenge, resubmit and block pages, the resident script, the hourly crawler refresh |
+| Job | the guard ladder: path readings, verdict cookie, crawler and allow-list passes, breaker, refusal shells | `/__mcl/state`, `/__mcl/verify` (Policy call and cookie minting), the challenge, resubmit and block pages, the resident script, the hourly crawler refresh |
 | Cost and latency | sub-millisecond, runs on every request | runs only inside the challenge flow |
 
 **Flow**: a visitor without a valid decision opens an assessed page. The Function answers

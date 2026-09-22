@@ -23,12 +23,23 @@ const DISTRIBUTION_DOMAIN = 'd111111abcdef8.cloudfront.net';
 const IP = '203.0.113.9';
 const FUNCTION_PATH = join(__dirname, '../src/function/index.js');
 const source = readFileSync(FUNCTION_PATH, 'utf8');
-const pathsCorpus = JSON.parse(
-	readFileSync(
-		join(__dirname, '../node_modules/@spur.us/monocle-edge-core/conformance/paths.v3.json'),
-		'utf8'
-	)
-) as { vectors: { name: string; input: string; reject?: boolean }[] };
+const corpus = (name: string) =>
+	JSON.parse(
+		readFileSync(join(__dirname, `../node_modules/@spur.us/monocle-edge-core/conformance/${name}`), 'utf8')
+	);
+const pathsCorpus = corpus('paths.v3.json') as {
+	vectors: { name: string; input: string; canonical?: string; reject?: boolean }[];
+};
+const readingsCorpus = corpus('readings.v1.json') as {
+	vectors: { name: string; input: string; readings?: string[]; reject?: boolean }[];
+};
+
+/** The readable source's own `readings`, which the deploy build renames. */
+function loadReadings(): (path: string) => string[] {
+	const body = source.replace(/^import cf from ["']cloudfront["'];?\n/, '');
+	const factory = new Function('cf', 'require', `${body}\nreturn readings;`);
+	return factory({}, createRequire(import.meta.url)) as (path: string) => string[];
+}
 
 function loadHandler(kv: Record<string, string>) {
 	const deployed = stripForDeploy(source);
@@ -421,16 +432,56 @@ describe('CloudFront Function (viewer-request)', () => {
 		expect(result.statusCode).toBe(404);
 	});
 
-	it('returns 400 for the strict-v3 reject corpus and challenges valid paths', async () => {
-		const handler = loadHandler(baseKv());
-		for (const vector of pathsCorpus.vectors) {
-			const event = viewerEvent({ uri: vector.input });
-			const result = (await handler(event)) as FnResponse;
-			if (vector.reject) {
-				expect(result.statusCode, vector.name).toBe(400);
-			} else {
-				expect(result.statusCode ?? 0, vector.name).not.toBe(400);
+	describe("edge-core's path readings", () => {
+		const readings = loadReadings();
+
+		it('reads every corpus path exactly as edge-core does', () => {
+			for (const vector of readingsCorpus.vectors) {
+				if (vector.reject) expect(() => readings(vector.input), vector.name).toThrow();
+				else expect([...readings(vector.input)].sort(), vector.name).toEqual(vector.readings);
 			}
+		});
+
+		it('gives every strict path exactly its canonical form', () => {
+			for (const vector of pathsCorpus.vectors) {
+				if (!vector.reject) expect(readings(vector.input), vector.name).toEqual([vector.canonical]);
+			}
+		});
+
+		// Run through the deploy build, which renames `readings`: each reading enforced on
+		// its own must refuse the request, so none an origin takes walks past.
+		it('enforces a path if any one of its readings is enforced', async () => {
+			for (const vector of readingsCorpus.vectors) {
+				if (vector.reject) {
+					const result = (await loadHandler(baseKv())(viewerEvent({ uri: vector.input }))) as FnResponse;
+					expect(result.statusCode, vector.name).toBe(400);
+					continue;
+				}
+				for (const reading of vector.readings!) {
+					// Nothing else is covered, so a reading the Function missed would pass.
+					const kv = baseKv({ [`p:${reading}`]: 'e' });
+					delete kv['s:/'];
+					const result = (await loadHandler(kv)(viewerEvent({ uri: vector.input }))) as FnResponse;
+					expect(result.statusCode, `${vector.name} via ${reading}`).toBe(503);
+				}
+			}
+		});
+	});
+
+	// A servlet container drops the parameter, so this is the enforced page, and the
+	// strict rule used to answer 400 for it on every page of the site.
+	it('enforces a path carrying ;jsessionid as the page it names', async () => {
+		const kv = baseKv({ 's:/members': 'e' });
+		const result = (await loadHandler(kv)(viewerEvent({ uri: '/members;jsessionid=ABC/page' }))) as FnResponse;
+		expect(result.statusCode).toBe(503);
+	});
+
+	it('passes an unprotected path whatever its spelling', async () => {
+		const kv = baseKv();
+		delete kv['s:/'];
+		for (const uri of ['/blog;jsessionid=ABC', '/files/a%2Fb.txt', '/a//b']) {
+			const event = viewerEvent({ uri });
+			expect(await loadHandler(kv)(event), uri).toBe(event.request);
 		}
 	});
 
