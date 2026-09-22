@@ -53,7 +53,6 @@ function baseKv(extra: Record<string, string> = {}): Record<string, string> {
 		k: SECRET,
 		cv: CV,
 		id: ID,
-		hosts: JSON.stringify([HOST]),
 		's:/': 'a',
 		...extra,
 	};
@@ -127,21 +126,25 @@ describe('CloudFront Function (viewer-request)', () => {
 		expect(deployed).toContain('async function handler');
 	});
 
-	it('passes /__mcl and descendants untouched', async () => {
+	// The Lambda's behaviors match `/__mcl/*`, which `/__mcl` itself does not, so it
+	// reaches this Function. Returning it early handed the origin whatever contract
+	// headers the viewer sent; every reserved path is answered here instead.
+	it('answers the reserved prefix at the edge rather than passing it to the origin', async () => {
 		const handler = loadHandler(baseKv());
-		for (const uri of ['/__mcl', '/__mcl/verify', '/__mcl/challenge', '/__mcl/abc/mcl.js']) {
-			const event = viewerEvent({ uri });
-			expect(await handler(event)).toBe(event.request);
+		for (const uri of ['/__mcl', '/__mcl/verify']) {
+			const result = (await handler(viewerEvent({ uri }))) as FnResponse;
+			expect(result.statusCode, uri).toBe(404);
 		}
 	});
 
-	it('fails open when the sealing key or contract version is missing', async () => {
+	it('fails open, marked, when the sealing key or contract version is missing', async () => {
 		const noKey = { ...baseKv() };
 		delete noKey.k;
-		const event = viewerEvent();
-		expect(await loadHandler(noKey)(event)).toBe(event.request);
-		const old = viewerEvent();
-		expect(await loadHandler(baseKv({ v: '1' }))(old)).toBe(old.request);
+		for (const kv of [noKey, baseKv({ v: '1' })]) {
+			const event = viewerEvent();
+			expect(await loadHandler(kv)(event)).toBe(event.request);
+			expect(event.request.headers['x-monocle-skip']?.value).toBe('config');
+		}
 	});
 
 	// Without id or cv no cookie can be opened, so a challenge could never be
@@ -156,43 +159,22 @@ describe('CloudFront Function (viewer-request)', () => {
 					request: { headers: Record<string, { value: string }> };
 				};
 				expect(await loadHandler(kv)(event)).toBe(event.request);
-				expect(event.request.headers['x-monocle-skip']?.value).toBe('no-config');
+				expect(event.request.headers['x-monocle-skip']?.value).toBe('config');
 			}
 		}
 	});
 
-	// A distribution is a site, so a deployment that names no hostname means every
-	// name it answers on - including one added years after setup.
-	it('protects every hostname the distribution serves when none are named', async () => {
-		for (const host of ['www.example.com', 'shop.example.com', DISTRIBUTION_DOMAIN]) {
-			const result = (await loadHandler({ ...baseKv(), hosts: '[]' })(
-				viewerEvent({ host })
-			)) as FnResponse;
-			expect(result.statusCode).toBe(503);
+	// CloudFront routes on the Host, so every name that reaches the Function is one the
+	// distribution serves, and reaches the same origin. Passing an unlisted one through
+	// made Monocle optional for whoever used the apex, an alias or *.cloudfront.net.
+	it('protects every hostname the distribution serves, whatever the host list says', async () => {
+		for (const hosts of [JSON.stringify([HOST]), '[]', undefined]) {
+			for (const host of [HOST, 'shop.example.com', DISTRIBUTION_DOMAIN]) {
+				const kv = hosts === undefined ? baseKv() : baseKv({ hosts });
+				const result = (await loadHandler(kv)(viewerEvent({ host }))) as FnResponse;
+				expect(result.statusCode, `${host} under ${hosts}`).toBe(503);
+			}
 		}
-	});
-
-	// Absent is a broken store, not a deployment choosing everything.
-	it('passes through when the host list is missing entirely', async () => {
-		const kv = { ...baseKv() };
-		delete kv.hosts;
-		const event = viewerEvent();
-		expect(await loadHandler(kv)(event)).toBe(event.request);
-	});
-
-	// Anyone can reach an alias deployment by its *.cloudfront.net name. Passing
-	// that through would make Monocle optional for whoever knows the domain.
-	it("protects the distribution's own domain as well as the configured host", async () => {
-		const result = (await loadHandler(baseKv())(
-			viewerEvent({ host: DISTRIBUTION_DOMAIN })
-		)) as FnResponse;
-		expect(result.statusCode).toBe(503);
-		expect(result.body).toContain('/__mcl/challenge?return=');
-	});
-
-	it('passes unlisted hosts untouched', async () => {
-		const event = viewerEvent({ host: 'other.example.com' });
-		expect(await loadHandler(baseKv())(event)).toBe(event.request);
 	});
 
 	it('challenges a cookieless assessed navigation with a 503 shell', async () => {
@@ -274,19 +256,7 @@ describe('CloudFront Function (viewer-request)', () => {
 		) => Promise<unknown>;
 		const event = viewerEvent();
 		expect(await handler(event)).toBe(event.request);
-	});
-
-	it('concatenates chunked hosts continuation keys', async () => {
-		const json = JSON.stringify([HOST]);
-		const split = Math.floor(json.length / 2);
-		const kv = baseKv({
-			hosts: json.slice(0, split),
-			'hosts.1': json.slice(split),
-		});
-		const result = (await loadHandler(kv)(viewerEvent())) as FnResponse;
-		expect(result.statusCode).toBe(503);
-		const other = viewerEvent({ host: 'nope.example.com' });
-		expect(await loadHandler(kv)(other)).toBe(other.request);
+		expect(event.request.headers['x-monocle-skip']?.value).toBe('error');
 	});
 
 	it('exempts a packed allow_ips hit on an enforce path', async () => {
@@ -317,6 +287,23 @@ describe('CloudFront Function (viewer-request)', () => {
 		expect(await handler(options)).toBe(options.request);
 		const robots = viewerEvent({ uri: '/robots.txt' });
 		expect(await handler(robots)).toBe(robots.request);
+	});
+
+	// A viewer-request Function cannot drop the origin's body, so the preflight pass
+	// edge-core gives would hand anyone the page an origin serves for OPTIONS.
+	it('holds an OPTIONS on an enforced path to a verdict, preflight or not', async () => {
+		const kv = baseKv({ 'p:/account': 'e' });
+		const preflight = viewerEvent({ uri: '/account', method: 'OPTIONS', secFetchMode: 'cors' });
+		preflight.request.headers.origin = { value: 'https://app.example' };
+		preflight.request.headers['access-control-request-method'] = { value: 'POST' };
+		expect(((await loadHandler(kv)(preflight)) as FnResponse).statusCode).toBe(403);
+		const cleared = viewerEvent({
+			uri: '/account',
+			method: 'OPTIONS',
+			secFetchMode: 'cors',
+			cookie: await mintCookie(),
+		});
+		expect(await loadHandler(kv)(cleared)).toBe(cleared.request);
 	});
 
 	it('does not exempt a crawler WebSocket', async () => {
@@ -461,8 +448,9 @@ describe('CloudFront Function (viewer-request)', () => {
 	it('passes traffic marked when the sealing key is not a 64-hex secret', async () => {
 		for (const bad of [SECRET.slice(0, 63), 'not-hex', '']) {
 			const handler = loadHandler(baseKv({ k: bad }));
-			const result = (await handler(viewerEvent({ uri: '/page' }))) as FnResponse;
-			expect(result.statusCode, JSON.stringify(bad)).toBeUndefined();
+			const event = viewerEvent({ uri: '/page' });
+			expect(await handler(event), JSON.stringify(bad)).toBe(event.request);
+			expect(event.request.headers['x-monocle-skip']?.value).toBe('config');
 		}
 	});
 
@@ -473,7 +461,7 @@ describe('CloudFront Function (viewer-request)', () => {
 		event.request.headers['x-monocle-skip'] = { value: 'spoofed' };
 		event.request.cookies = { '__Host-mcl_c': { value: 'forged' } };
 		const result = (await handler(event)) as { headers?: Record<string, unknown>; cookies?: Record<string, unknown> };
-		expect(result.headers?.['x-monocle-skip']).toBeUndefined();
+		expect(result.headers?.['x-monocle-skip']).toEqual({ value: 'config' });
 		expect(result.cookies?.['__Host-mcl_c']).toBeUndefined();
 	});
 

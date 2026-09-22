@@ -6,7 +6,6 @@ async function handler(event) {
 	var req = event.request;
 	try {
 		var uri = typeof req.uri === 'string' ? req.uri : '/';
-		if (uri === '/__mcl' || uri.indexOf('/__mcl/') === 0) return req;
 		// Before any return: a viewer must not be able to hand the origin a
 		// contract header or one of our cookies just because a later check fails
 		// open. The verdict is read out first, since strip removes it.
@@ -18,30 +17,10 @@ async function handler(event) {
 		// Buffer.from is lenient: a truncated or non-hex value would become a
 		// DIFFERENT key and reject every cookie the Lambda minted, leaving the
 		// visitor in a challenge loop. An unusable key fails open instead.
-		if (!key || !/^[0-9a-f]{64}$/i.test(key) || ver !== '2') return req;
-		var host = req.headers.host ? req.headers.host.value : '';
-		var c = host.lastIndexOf(':');
-		if (c > 0 && host.indexOf(']') === -1) host = host.slice(0, c);
-		host = host.toLowerCase();
-		var hostsRaw = await readChunks(kvs, 'hosts');
-		// Absent is a store we cannot use, which fails open like the rest of them.
-		// An empty list is a deployment that says every hostname this distribution
-		// serves - a distribution is a site, so that is the safe default, and it
-		// covers an alias added long after setup.
-		if (!hostsRaw) return req;
-		var hosts;
-		try {
-			hosts = JSON.parse(hostsRaw);
-		} catch (e) {
-			return req;
-		}
-		// The distribution's own *.cloudfront.net name reaches the same origin and
-		// config, so an alias deployment would be bypassable through it. Treated as
-		// the configured host, not a second one; the Lambda's verify Origin agrees.
-		if (!Array.isArray(hosts)) return req;
-		var own = event.context && event.context.distributionDomainName;
-		if (hosts.length && hosts.indexOf(host) === -1 && host !== (own ? own.toLowerCase() : null))
-			return req;
+		if (!key || !/^[0-9a-f]{64}$/i.test(key) || ver !== '2') return skip(req, 'config');
+		// No host check: CloudFront routes on the Host, so every one that arrives is
+		// a name this distribution serves. An alias the deployment does not list, or
+		// the *.cloudfront.net name, reaches the same origin and is the same site.
 		var path;
 		try {
 			path = canon(uri);
@@ -68,17 +47,16 @@ async function handler(event) {
 		// and a refusal would hit every visitor, not the ones the policy flags.
 		// Pass, marked, so the origin and a curl can see the store is
 		// inconsistent; the fix is the missing keys, never a challenge loop.
-		if (!id || !cv) {
-			req.headers['x-monocle-skip'] = { value: 'no-config' };
-			return req;
-		}
+		if (!id || !cv) return skip(req, 'config');
 		var verdict = cookieVal ? openVerdict(cookieVal, key, id, cv, bind) : null;
 		if (safe && !ws) {
 			var botsRaw = await readChunks(kvs, 'bots');
 			if (botsRaw && inPacked(ip, botsRaw)) return req;
 			if (hit !== 'e' && infra(path)) return req;
 		}
-		if (method === 'OPTIONS') return req;
+		// No preflight pass, unlike edge-core, which returns only a preflight's
+		// headers. A viewer-request Function cannot drop the origin's body, so an
+		// OPTIONS here needs a verdict like any other method.
 		if (hit === 'e') {
 			var ipsRaw = await readChunks(kvs, 'ips');
 			if (ipsRaw && inPacked(ip, ipsRaw)) return req;
@@ -98,8 +76,15 @@ async function handler(event) {
 		}
 		return req;
 	} catch (e) {
-		return req;
+		return skip(req, 'error');
 	}
+}
+
+// A pass through with Monocle out of the way, marked for the origin. strip()
+// has already removed any value the viewer sent under this name.
+function skip(req, why) {
+	req.headers['x-monocle-skip'] = { value: why };
+	return req;
 }
 
 async function g(kvs, key) {

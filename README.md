@@ -16,7 +16,7 @@ Two runtimes split the work (see `src/`):
 | | CloudFront Function (`src/function/index.js`) | Lambda@Edge (`src/lambda/`) |
 |---|---|---|
 | Trigger | viewer-request on the default behavior and every customer behavior | origin-request on the `/__mcl/*` behaviors only |
-| Job | the guard ladder: host check, path canonicalization, verdict cookie, crawler and allow-list passes, breaker, refusal shells | `/__mcl/state`, `/__mcl/verify` (Policy call and cookie minting), the challenge, resubmit and block pages, the resident script, the hourly crawler refresh |
+| Job | the guard ladder: path canonicalization, verdict cookie, crawler and allow-list passes, breaker, refusal shells | `/__mcl/state`, `/__mcl/verify` (Policy call and cookie minting), the challenge, resubmit and block pages, the resident script, the hourly crawler refresh |
 | Cost and latency | sub-millisecond, runs on every request | runs only inside the challenge flow |
 
 **Flow**: a visitor without a valid decision opens an assessed page. The Function answers
@@ -27,6 +27,12 @@ the return path, and the Function passes the request through to **cache and orig
 untouched**. Enforced paths refuse a cookieless request by shape (challenge shell, resubmit
 shell, challenge JSON, or an empty 403 for WebSockets) and answer a block verdict with the
 customer's block page, redirect or JSON.
+
+The Function protects every hostname the distribution serves. CloudFront routes on the Host,
+so an alias the deployment does not list, or the `*.cloudfront.net` name, reaches the same
+origin and is the same site. `OPTIONS` needs a verdict on an enforced path like any other
+method: the edge core passes a CORS preflight and returns only its headers, but a
+viewer-request Function cannot drop the origin's body.
 
 Verified traffic and every uncovered path keep CloudFront's edge caching, because a
 viewer-request Function can `return request`.
@@ -71,18 +77,13 @@ identical for every visitor, so `GET /__mcl/state` returns `{hint, degraded, sid
 the session cookie when tracking is on and none is held, and the scripts append `cpd`
 themselves before loading the core. The session cookie is attribution only.
 
-## KeyValueStore keys (read by the Function; `cv`, `cfg` and `hosts` by the Lambda too)
+## KeyValueStore keys (read by the Function unless noted; `cv` and `cfg` by the Lambda too)
 
 | Key | Value | Writer |
 |---|---|---|
 | `v` | `2` | dashboard |
-| `g` | generation the dashboard last wrote | dashboard |
-| `hosts` | JSON array with the lowercase hostname the deployment protects (the dashboard writes one) | dashboard |
-<!-- The Function also acts on `event.context.distributionDomainName`, the distribution's own
-     *.cloudfront.net address: same origin, same config, and the one host a visitor can choose to
-     reach this deployment. It is never written to `hosts`; a deployment still protects one
-     configured hostname. The Lambda already trusts it the same way for the verify Origin check. -->
-| `k`, `kp` | sealing key hex; previous key during rotation | dashboard |
+| `hosts` | Lambda only: JSON array of lowercase hostnames verify accepts an `Origin` from, besides the distribution's own domain and any browser stating `Sec-Fetch-Site: same-origin` | dashboard |
+| `k` | sealing key hex | dashboard |
 | `cv` | clearance version, 64 lowercase hex | dashboard |
 | `id` | deployment id, the cookie audience | dashboard |
 | `cfg` | JSON `{session_tracking, block_page, custom_domain}` | dashboard |
@@ -91,7 +92,7 @@ themselves before loading the core. The session cookie is attribution only.
 | `p:<path>` | `e` enforced exact, `a` assessed exact | dashboard |
 | `s:<prefix>` | `e` enforced subtree, `a` assessed subtree | dashboard |
 | `bots` | packed crawler ranges plus `expiresAt` | Lambda, hourly |
-| `brk` | breaker open-until epoch seconds | Lambda, on transition |
+| `brk` | breaker open-until epoch seconds | Lambda, whenever the deadline moves |
 
 Route resolution is a walk: for `/a/b/c` the Function reads `p:/a/b/c`, then `s:/a/b/c`,
 `s:/a/b`, `s:/a`, `s:/`, then scans `w`. Enforcement applies if any `e` matches; assessment
@@ -103,7 +104,6 @@ if any `a` matches. There is no specificity contest between the two, as in the e
 {
 	"secretKey": "<monocle secret key>",
 	"cookieSecret": "<hex sealing key>",
-	"cookieSecretPrevious": "<hex, optional during rotation>",
 	"publishableKey": "<monocle publishable key>",
 	"deploymentId": "<app id>",
 	"kvsArn": "arn:aws:cloudfront::<account>:key-value-store/<id>"

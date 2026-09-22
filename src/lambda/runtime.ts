@@ -33,9 +33,21 @@ export interface Runtime extends EndpointRuntime {
 
 let cached: { until: number; identity: string; runtime: Runtime } | undefined;
 
-export async function getRuntime(baked: BakedConfig, kvs: Kvs, now = Date.now()): Promise<Runtime> {
+/**
+ * `freshClearance` re-reads the clearance version inside the cache window. Verify mints
+ * against it, and a container holding the one from before a rotation mints cookies the
+ * Function refuses, sending a visitor who has just passed back to the challenge.
+ */
+export async function getRuntime(
+	baked: BakedConfig,
+	kvs: Kvs,
+	{ now = Date.now(), freshClearance = false }: { now?: number; freshClearance?: boolean } = {}
+): Promise<Runtime> {
 	const identity = `${baked.cookieSecret}|${baked.deploymentId}|${baked.publishableKey}|${baked.secretKey}`;
-	if (cached && cached.identity === identity && now < cached.until) return cached.runtime;
+	if (cached && cached.identity === identity && now < cached.until) {
+		if (!freshClearance) return cached.runtime;
+		if (((await kvs.get('cv')) ?? '') === cached.runtime.clearanceVersion) return cached.runtime;
+	}
 
 	const cv = (await kvs.get('cv')) ?? '';
 	const cfgRaw = (await readChunks(kvs, 'cfg')) ?? '{}';
