@@ -38,10 +38,10 @@ CloudFront hides the `Upgrade` header from edge functions, so the Function recog
 WebSocket handshake by its `Sec-WebSocket-Key`.
 
 The Lambda reads the KeyValueStore through its API, a billed call that can be throttled while
-the Function's edge copy still answers, so each container reads it at most once a minute. After
-a rotation a container can go on minting against the version it holds for that minute, so the
-Function, and state and verify, stand a cookie on another version while it is at most two
-minutes old. A container keeps the runtime it last built, however old, when the store cannot be
+the Function's edge copy still answers, so each container reads it at most once every five
+minutes. After a rotation a container can go on minting against the version it holds for those
+five minutes, so the Function, and state and verify, stand a cookie on another version while it
+is at most six minutes old. A container keeps the runtime it last built, however old, when the store cannot be
 read, taking the clearance version if that much was read. A cold one serves every page on
 defaults, cached for no longer than CloudFront's minimum TTL, and verify gives the ten-minute
 pass it gives when Policy cannot answer, under an empty clearance version. The Function accepts
@@ -102,7 +102,6 @@ themselves before loading the core. The session cookie is attribution only.
 | Key | Value | Writer |
 |---|---|---|
 | `v` | `2` | dashboard |
-| `hosts` | Lambda only: JSON array of lowercase hostnames verify accepts an `Origin` from, besides the distribution's own domain and any browser stating `Sec-Fetch-Site: same-origin` | dashboard |
 | `k` | sealing key hex | dashboard |
 | `cv` | clearance version, 64 lowercase hex | dashboard |
 | `id` | deployment id, the cookie audience | dashboard |
@@ -125,9 +124,14 @@ if any `a` matches. There is no specificity contest between the two, as in the e
 	"cookieSecret": "<hex sealing key>",
 	"publishableKey": "<monocle publishable key>",
 	"deploymentId": "<app id>",
-	"kvsArn": "arn:aws:cloudfront::<account>:key-value-store/<id>"
+	"kvsArn": "arn:aws:cloudfront::<account>:key-value-store/<id>",
+	"hosts": ["<every name the distribution serves>"]
 }
 ```
+
+`hosts` is every name the distribution served at deploy, each the same site: verify accepts an
+`Origin` from them, from the distribution's own domain, and from any browser stating
+`Sec-Fetch-Site: same-origin`.
 
 The Lambda's execution role needs `cloudfront-keyvaluestore:DescribeKeyValueStore`,
 `GetKey` and `UpdateKeys` on that store. An EventBridge Scheduler rule invokes the same

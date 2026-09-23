@@ -369,10 +369,10 @@ function openVerdict(sealed, key, aud, cv, bind) {
 		!p.jti ||
 		p.jti.length > 128 ||
 		// Another version stands only as the pass a Lambda that could not read the store gives, an
-		// allow with at most ten minutes left, or when minted in the last two minutes, by a Lambda
+		// allow with at most ten minutes left, or when minted in the last six minutes, by a Lambda
 		// that had not yet read a rotation.
 		(p.clearanceVersion !== cv &&
-			!(p.clearanceVersion === '' ? p.verdict === 'allow' && p.exp <= now + 600 : p.exp > now + ttl - 120)) ||
+			!(p.clearanceVersion === '' ? p.verdict === 'allow' && p.exp <= now + 600 : p.exp > now + ttl - 360)) ||
 		now >= p.exp ||
 		p.ip !== bind
 	)

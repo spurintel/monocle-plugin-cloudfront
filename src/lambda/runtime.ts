@@ -27,7 +27,6 @@ export interface LiveConfig {
 	customDomain?: string;
 	clearanceVersion: string;
 	cfgRaw: string;
-	hosts: string[];
 	/**
 	 * The store could not be read and this container had nothing to fall back on, so the
 	 * rest is defaults and the clearance version is unknown (empty).
@@ -47,7 +46,7 @@ let cached: { until: number; identity: string; runtime: Runtime } | undefined;
 /**
  * The store is read at most once per cache window: each read is a billed KeyValueStore API
  * call, and state is asked on every page view. A version rotated inside the window is
- * absorbed by the Function, which honours a cookie minted in the last two minutes on another
+ * absorbed by the Function, which honours a cookie minted in the last six minutes on another
  * version, and by `honoursClearance`, which gives state and verify the same rule.
  *
  * A store that cannot be read is ours to absorb: the runtime this container last built stands,
@@ -66,25 +65,24 @@ export async function getRuntime(
 	const held = cached && cached.identity === identity ? cached : undefined;
 	if (held && now < held.until) return held.runtime;
 
-	let cv: string | undefined, cfgRaw: string, hostsRaw: string;
+	let cv: string | undefined, cfgRaw: string;
 	try {
 		cv = (await kvs.get('cv')) ?? '';
 		cfgRaw = (await readChunks(kvs, 'cfg')) ?? '{}';
-		hostsRaw = (await readChunks(kvs, 'hosts')) ?? '[]';
 	} catch (error) {
 		console.warn(`monocle store unreadable: ${error instanceof Error ? error.name : 'unknown'}`);
 		const live = held?.runtime.live;
 		const runtime =
 			held && (cv === undefined || cv === held.runtime.clearanceVersion)
 				? held.runtime
-				: await build(baked, cv ?? '', live?.cfgRaw ?? '{}', JSON.stringify(live?.hosts ?? []), {
+				: await build(baked, cv ?? '', live?.cfgRaw ?? '{}', {
 						unread: cv === undefined,
 						defaults: !live || live.defaults === true,
 					});
 		cached = { until: now + KVS_RETRY_MS, identity, runtime };
 		return runtime;
 	}
-	const runtime = await build(baked, cv, cfgRaw, hostsRaw, {});
+	const runtime = await build(baked, cv, cfgRaw, {});
 	cached = { until: now + KVS_CACHE_MS, identity, runtime };
 	return runtime;
 }
@@ -93,7 +91,6 @@ async function build(
 	baked: BakedConfig,
 	cv: string,
 	cfgRaw: string,
-	hostsRaw: string,
 	{ unread = false, defaults = false }: { unread?: boolean; defaults?: boolean }
 ): Promise<Runtime> {
 	let parsed: { session_tracking?: unknown; block_page?: unknown; custom_domain?: unknown } = {};
@@ -101,15 +98,6 @@ async function build(
 		parsed = JSON.parse(cfgRaw) as typeof parsed;
 	} catch {
 		parsed = {};
-	}
-	let hosts: string[] = [];
-	try {
-		const parsedHosts = JSON.parse(hostsRaw) as unknown;
-		if (Array.isArray(parsedHosts)) {
-			hosts = parsedHosts.filter((h): h is string => typeof h === 'string').map((h) => h.toLowerCase());
-		}
-	} catch {
-		hosts = [];
 	}
 	const customDomain =
 		typeof parsed.custom_domain === 'string' && parsed.custom_domain ? parsed.custom_domain : undefined;
@@ -119,7 +107,6 @@ async function build(
 		customDomain,
 		clearanceVersion: cv,
 		cfgRaw,
-		hosts,
 		...(unread && { unread }),
 		...(defaults && { defaults }),
 	};
@@ -146,7 +133,7 @@ async function build(
 /**
  * The Function's rule for a verdict cookie on another clearance version, so state and verify
  * answer as it does: the pass a container that could not read the store gives, an allow with at
- * most ten minutes left, or a cookie minted in the last two minutes, by a container that had
+ * most ten minutes left, or a cookie minted in the last six minutes, by a container that had
  * not yet read a rotation.
  */
 export function honoursClearance(payload: VerdictPayload, nowSeconds: number): boolean {

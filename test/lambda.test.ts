@@ -18,7 +18,7 @@ import { CRAWLER_FEEDS, refreshCrawlerRanges } from '../src/lambda/crawler';
 import { handleOriginRequest, handler } from '../src/lambda/index';
 import { MemoryKvs, readChunks, writeChunks } from '../src/lambda/kvs';
 import { getRuntime, honoursClearance, resetRuntimeCache } from '../src/lambda/runtime';
-import { KVS_RETRY_MS } from '../src/shared/constants';
+import { KVS_RETRY_MS, ROTATION_GRACE_SECONDS } from '../src/shared/constants';
 import { createHmacSealer } from '@spur.us/monocle-edge-core';
 
 const SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
@@ -32,18 +32,13 @@ const BAKED: BakedConfig = {
 	publishableKey: 'pk_live_123',
 	deploymentId: ID,
 	kvsArn: 'arn:aws:cloudfront::123:key-value-store/abc',
+	hosts: ['www.example.com'],
 };
 
-/**
- * A deployment naming one hostname, which is what most of these cases are about.
- * Pass `hosts: '[]'` for the deployment that protects every hostname the
- * distribution serves.
- */
 function liveKvs(extra: Record<string, string> = {}) {
 	return new MemoryKvs({
 		cv: CV,
 		cfg: JSON.stringify({ session_tracking: 'off' }),
-		hosts: JSON.stringify(['www.example.com']),
 		...extra,
 	});
 }
@@ -164,26 +159,9 @@ describe('handleOriginRequest /__mcl/*', () => {
 		expect(JSON.parse(result.body ?? '{}').verdict).toBe('allow');
 	});
 
-	// A deployment protecting every hostname the distribution serves has no list to
-	// match an Origin against, so the browser's own same-origin statement is what
-	// stands in - and a cross-site caller cannot truthfully make it.
-	it('accepts a same-origin verify from any hostname when none are named', async () => {
-		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(policyResponse(true)));
-		const result = await handleOriginRequest(
-			originEvent({
-				body: { captchaData: 'bundle' },
-				headers: {
-					Origin: 'https://anything.example.com',
-					'Sec-Fetch-Site': 'same-origin',
-				},
-			}),
-			{ config: BAKED, kvs: liveKvs({ hosts: '[]' }) }
-		);
-		expect(result.status).toBe('200');
-	});
-
-	// The Function protects every name the distribution serves, so a visitor on an alias
-	// the list leaves out has to be able to pass the challenge there too.
+	// The Function protects every name the distribution serves, so a visitor on an alias added
+	// since deploy has to be able to pass the challenge there too. The browser's own same-origin
+	// statement stands in, and a cross-site caller cannot truthfully make it.
 	it('accepts a same-origin verify from an alias the host list does not name', async () => {
 		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(policyResponse(true)));
 		const result = await handleOriginRequest(
@@ -196,7 +174,7 @@ describe('handleOriginRequest /__mcl/*', () => {
 		expect(result.status).toBe('200');
 	});
 
-	it('still refuses a verify that does not claim same-origin when none are named', async () => {
+	it('still refuses a verify from another host that does not claim same-origin', async () => {
 		const fetchMock = vi.fn();
 		vi.stubGlobal('fetch', fetchMock);
 		for (const site of ['cross-site', 'same-site', 'none']) {
@@ -205,14 +183,14 @@ describe('handleOriginRequest /__mcl/*', () => {
 					body: { captchaData: 'bundle' },
 					headers: { Origin: 'https://attacker.example', 'Sec-Fetch-Site': site },
 				}),
-				{ config: BAKED, kvs: liveKvs({ hosts: '[]' }) }
+				{ config: BAKED, kvs: liveKvs() }
 			);
 			expect(result.status).toBe('403');
 		}
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
-	it('accepts verify Origin that matches a protected host in KVS', async () => {
+	it('accepts a verify Origin the deploy baked in', async () => {
 		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(policyResponse(true)));
 		const result = await handleOriginRequest(
 			originEvent({
@@ -221,7 +199,7 @@ describe('handleOriginRequest /__mcl/*', () => {
 				body: { captchaData: 'bundle' },
 				headers: { Origin: 'https://www.example.com' },
 			}),
-			{ config: BAKED, kvs: liveKvs({ hosts: JSON.stringify(['www.example.com']) }) }
+			{ config: BAKED, kvs: liveKvs() }
 		);
 		expect(result.status).toBe('200');
 	});
@@ -391,7 +369,7 @@ describe('fixes from the audit', () => {
 				body: { captchaData: 'bundle' },
 				headers: { Origin: 'https://origin.internal.example' },
 			}),
-			{ config: BAKED, kvs: liveKvs({ hosts: JSON.stringify(['www.example.com']) }) }
+			{ config: BAKED, kvs: liveKvs() }
 		);
 		expect(result.status).toBe('403');
 		expect(JSON.parse(result.body ?? '{}').error).toBe('origin');
@@ -428,8 +406,11 @@ describe('fixes from the audit', () => {
 		vi.stubGlobal('fetch', vi.fn(async () => policyResponse(true)));
 		const kvs = liveKvs();
 		const deps = { config: BAKED, kvs };
-		await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), deps);
 		const get = vi.spyOn(kvs, 'get');
+		await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), deps);
+		// The version, and the config with the probe for a second chunk: three billed calls.
+		expect(get.mock.calls.map(([key]) => key)).toEqual(['cv', 'cfg', 'cfg.1']);
+		get.mockClear();
 		for (let i = 0; i < 5; i++) {
 			await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), deps);
 			await handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), deps);
@@ -438,7 +419,7 @@ describe('fixes from the audit', () => {
 	});
 
 	// Until its window ends a container mints against the version it holds. The Function, and
-	// state and verify through honoursClearance, stand such a cookie for two minutes.
+	// state and verify through honoursClearance, stand such a cookie for six minutes.
 	it('mints against the version it holds, which the edge honours across a rotation', async () => {
 		vi.stubGlobal('fetch', vi.fn(async () => policyResponse(true)));
 		const kvs = liveKvs();
@@ -460,7 +441,7 @@ describe('fixes from the audit', () => {
 			});
 		expect((await read(nowSeconds, honoursClearance)).status).toBe('allow');
 		expect((await read(nowSeconds)).status).toBe('absent');
-		expect((await read(nowSeconds + 121, honoursClearance)).status).toBe('absent');
+		expect((await read(nowSeconds + ROTATION_GRACE_SECONDS + 1, honoursClearance)).status).toBe('absent');
 	});
 
 	// A store that cannot be read is ours. A container with a runtime keeps using it, however old;
@@ -571,8 +552,8 @@ describe('fixes from the audit', () => {
 		expect(policy).toHaveBeenCalled();
 	});
 
-	// Without the store's host list only the distribution's own name would be a same-origin
-	// Origin, and a browser that sends no Sec-Fetch-Site could not verify on the site's own name.
+	// The Origin list is baked at deploy, so a browser that sends no Sec-Fetch-Site can verify on
+	// the site's own name while the store cannot be read.
 	it('checks verify against the hosts baked at deploy when the store cannot be read', async () => {
 		const kvs = liveKvs();
 		vi.spyOn(kvs, 'get').mockRejectedValue(new Error('ThrottlingException'));
@@ -587,7 +568,7 @@ describe('fixes from the audit', () => {
 	it('checks verify against the names the distribution served at deploy', async () => {
 		const result = await handleOriginRequest(
 			originEvent({ body: { captchaData: 'bundle' }, host: 'alias.example.com', distributionDomainName: 'd111.cloudfront.net' }),
-			{ config: { ...BAKED, hosts: ['alias.example.com', 'd111.cloudfront.net'] }, kvs: liveKvs({ hosts: '[]' }) }
+			{ config: { ...BAKED, hosts: ['alias.example.com', 'd111.cloudfront.net'] }, kvs: liveKvs() }
 		);
 		expect(result.status).not.toBe('403');
 	});
@@ -628,7 +609,7 @@ describe('fixes from the audit', () => {
 	});
 
 	// The Function reads a rotation before a warm container does, and refuses an allow on the
-	// old version minted more than two minutes ago. Handing that cookie back would send the
+	// old version minted more than six minutes ago. Handing that cookie back would send the
 	// visitor from the challenge to the page and back until the container read the store.
 	it('mints again for an allow the Function would refuse after a rotation', async () => {
 		const policy = vi.fn(async () => policyResponse(true));
