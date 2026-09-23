@@ -99,10 +99,12 @@ export async function handleOriginRequest(
 	const unread = runtime.live.unread === true;
 	const connectingIp = request.clientIp || null;
 	const distributionDomain = record.cf.config?.distributionDomainName?.toLowerCase();
-	// The deployment's hosts, plus the distribution's own domain. Never the origin-request Host,
-	// which names the customer's origin, not a viewer host. An alias the list leaves out passes
-	// on the browser's same-origin statement, which edge-core accepts alongside the list.
-	const allowedOrigins = [...runtime.live.hosts, ...(distributionDomain ? [distributionDomain] : [])];
+	// The deployment's hosts, the distribution's names at deploy, and its own domain. Never the
+	// origin-request Host, which names the customer's origin, not a viewer host. An alias added
+	// since passes on the browser's same-origin statement, which edge-core accepts alongside.
+	const allowedOrigins = [
+		...new Set([...runtime.live.hosts, ...(config.hosts ?? []), ...(distributionDomain ? [distributionDomain] : [])]),
+	];
 	// CloudFront keeps one cache entry for GET and HEAD, so a HEAD answered without a body on a
 	// cached page would leave it empty for every GET until it expired. There a HEAD is answered
 	// as a GET, and CloudFront sends the viewer the headers alone.

@@ -555,6 +555,15 @@ describe('fixes from the audit', () => {
 		expect(result.status).toBe('200');
 	});
 
+	// A deployment covering the whole distribution lists no hosts; its aliases are still the site.
+	it('checks verify against the names the distribution served at deploy', async () => {
+		const result = await handleOriginRequest(
+			originEvent({ body: { captchaData: 'bundle' }, host: 'alias.example.com', distributionDomainName: 'd111.cloudfront.net' }),
+			{ config: { ...BAKED, hosts: ['alias.example.com', 'd111.cloudfront.net'] }, kvs: liveKvs({ hosts: '[]' }) }
+		);
+		expect(result.status).not.toBe('403');
+	});
+
 	// CloudFront keeps one cache entry for GET and HEAD, so a HEAD must not fill the cached
 	// challenge page with an empty body.
 	it('answers a HEAD for a cached page as a GET', async () => {

@@ -73,7 +73,7 @@ export async function getRuntime(
 		console.warn(`monocle store unreadable: ${error instanceof Error ? error.name : 'unknown'}`);
 		if (held && (cv === undefined || cv === held.runtime.clearanceVersion)) return held.runtime;
 		const live = held?.runtime.live;
-		return build(baked, cv ?? '', live?.cfgRaw ?? '{}', JSON.stringify(live?.hosts ?? baked.hosts ?? []), {
+		return build(baked, cv ?? '', live?.cfgRaw ?? '{}', JSON.stringify(live?.hosts ?? []), {
 			unread: cv === undefined,
 			defaults: !live,
 		});

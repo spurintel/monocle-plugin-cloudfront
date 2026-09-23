@@ -14,7 +14,10 @@ export interface BakedConfig {
 	publishableKey: string;
 	deploymentId: string;
 	kvsArn: string;
-	/** The deployment's hosts when it was deployed: verify's Origin list while the store cannot be read. */
+	/**
+	 * Every name the distribution served at deploy, each the same site, so verify's Origin list
+	 * holds them when the store's list is empty (the whole distribution) or cannot be read.
+	 */
 	hosts?: string[];
 }
 
