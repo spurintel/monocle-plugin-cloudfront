@@ -7,6 +7,7 @@ import {
 	COOKIE_SCOPE,
 	mintVerdictCookie,
 	packCidrSet,
+	routedAliases,
 } from '@spur.us/monocle-edge-core';
 import { describe, expect, it } from 'vitest';
 
@@ -31,15 +32,22 @@ const pathsCorpus = corpus('paths.v3.json') as {
 	vectors: { name: string; input: string; canonical?: string; reject?: boolean }[];
 };
 const readingsCorpus = corpus('readings.v1.json') as {
-	vectors: { name: string; input: string; readings?: string[]; reject?: boolean }[];
+	vectors: {
+		name: string;
+		input: string;
+		readings?: string[];
+		reject?: boolean;
+		routed?: { safe: string[] | 'reject'; unsafe: string[] | 'reject' };
+	}[];
 };
 
-/** The readable source's own `readings`, which the deploy build renames. */
-function loadReadings(): (path: string) => string[] {
+/** A function of the readable source, which the deploy build renames. */
+function loadSource<T>(name: 'readings' | 'routed'): T {
 	const body = source.replace(/^import cf from ["']cloudfront["'];?\n/, '');
-	const factory = new Function('cf', 'require', `${body}\nreturn readings;`);
-	return factory({}, createRequire(import.meta.url)) as (path: string) => string[];
+	const factory = new Function('cf', 'require', `${body}\nreturn ${name};`);
+	return factory({}, createRequire(import.meta.url)) as T;
 }
+const loadReadings = () => loadSource<(path: string) => string[]>('readings');
 
 function loadHandler(kv: Record<string, string>) {
 	const deployed = stripForDeploy(source);
@@ -534,6 +542,30 @@ describe('CloudFront Function (viewer-request)', () => {
 			}
 		});
 
+		it('gives every corpus path the aliases edge-core routes it to', () => {
+			const routed = loadSource<(paths: string[], unsafe: boolean) => string[]>('routed');
+			for (const vector of readingsCorpus.vectors) {
+				if (!vector.routed) continue;
+				for (const [unsafe, want] of [
+					[false, vector.routed.safe],
+					[true, vector.routed.unsafe],
+				] as const) {
+					const read = readings(vector.input);
+					if (want === 'reject') expect(() => routed(read, unsafe), vector.name).toThrow();
+					else expect([...routed(read, unsafe)].sort(), `${vector.name} unsafe=${unsafe}`).toEqual(want);
+				}
+			}
+		});
+
+		// `.` stops at a line separator, so the trailing-slash trim must not use it.
+		it('trims an alias beside a line separator as edge-core does', () => {
+			const routed = loadSource<(paths: string[], unsafe: boolean) => string[]>('routed');
+			for (const input of ['/a%E2%80%A8/.json', '/a%E2%80%A9/b.json', '/x%E2%80%A8/b.php/c']) {
+				const read = readings(input);
+				expect([...routed(read, true)].sort(), input).toEqual(routedAliases(read, true).sort());
+			}
+		});
+
 		it('gives every strict path exactly its canonical form', () => {
 			for (const vector of pathsCorpus.vectors) {
 				if (!vector.reject) expect(readings(vector.input), vector.name).toEqual([vector.canonical]);
@@ -557,6 +589,37 @@ describe('CloudFront Function (viewer-request)', () => {
 					expect(result.statusCode, `${vector.name} via ${reading}`).toBe(503);
 				}
 			}
+		});
+
+		// An alias enforces a request the way the reading it came from would, and nothing else.
+		it('enforces a request if an action a router takes it to is enforced', async () => {
+			for (const vector of readingsCorpus.vectors) {
+				if (!vector.routed) continue;
+				for (const [method, want] of [
+					['GET', vector.routed.safe],
+					['POST', vector.routed.unsafe],
+				] as const) {
+					const event = () => viewerEvent({ uri: vector.input, method });
+					if (want === 'reject') {
+						const result = (await loadHandler(baseKv())(event())) as FnResponse;
+						expect(result.statusCode, `${vector.name} ${method}`).toBe(400);
+						continue;
+					}
+					for (const alias of want) {
+						const kv = baseKv({ [`p:${alias}`]: 'e' });
+						delete kv['s:/'];
+						const result = (await loadHandler(kv)(event())) as FnResponse;
+						expect(result.statusCode, `${vector.name} ${method} via ${alias}`).toBe(method === 'GET' ? 503 : 403);
+					}
+				}
+			}
+		});
+
+		it('reads a format suffix off only a request that changes something', async () => {
+			const kv = baseKv({ 'p:/checkout': 'e' });
+			delete kv['s:/'];
+			const event = viewerEvent({ uri: '/checkout.css' });
+			expect(await loadHandler(kv)(event)).toBe(event.request);
 		});
 	});
 

@@ -23,9 +23,12 @@ async function handler(event) {
 		// No host check: CloudFront routes on the Host, so every one that arrives is
 		// a name this distribution serves. An alias the deployment does not list, or
 		// the *.cloudfront.net name, reaches the same origin and is the same site.
-		var paths;
+		var method = (req.method || 'GET').toUpperCase();
+		var safe = method === 'GET' || method === 'HEAD';
+		var paths, al;
 		try {
 			paths = readings(uri);
+			al = routed(paths, !safe);
 		} catch (e) {
 			return resp(400, H('text/plain; charset=utf-8'), '');
 		}
@@ -48,15 +51,18 @@ async function handler(event) {
 				if (h === 'a') asm = true;
 			}
 		}
+		// An action a router may take the request to name adds its enforcement, and nothing else.
+		for (i = 0; i < al.length && hit !== 'e'; i++) {
+			h = await resolve(kvs, al[i], w);
+			if (h === 'e') hit = 'e';
+		}
 		if (!hit) return req;
-		var method = (req.method || 'GET').toUpperCase();
 		var hd = req.headers;
 		// CloudFront hides Upgrade from functions; every WebSocket handshake carries this.
 		var ws = !!hd['sec-websocket-key'];
 		var sec = hd['sec-fetch-mode'] ? hd['sec-fetch-mode'].value : '';
 		var acc = hd.accept ? hd.accept.value : '';
 		var nav = !ws && (sec.toLowerCase() === 'navigate' || acc.indexOf('application/xhtml+xml') !== -1);
-		var safe = method === 'GET' || method === 'HEAD';
 		var ip = event.viewer && event.viewer.ip ? event.viewer.ip : '';
 		var bind = binding(ip);
 		var cv = await g(kvs, 'cv');
@@ -142,9 +148,10 @@ function one(c) {
 }
 
 // Every path an origin might take the request path to mean: decoding (up to twice),
-// cutting at a decoded `?` or `#`, dropping `;params`, turning backslashes to slashes,
-// merging slashes and resolving dot segments, taken in every order until nothing new
-// appears, since origins apply them in different orders. Mirrors edge-core's
+// decoding IIS's `%uXXXX`, cutting at a decoded `?` or `#`, dropping `;params`,
+// turning backslashes to slashes, merging slashes and resolving dot segments, taken
+// in every order until nothing new appears, since origins apply them in different
+// orders. Mirrors edge-core's
 // pathReadings step for step; the shared corpus pins them together. Throws for what no
 // ordinary client sends.
 function readings(raw) {
@@ -196,6 +203,13 @@ function readings(raw) {
 			}
 		}
 		if (/%2f/i.test(f)) reach(f.replace(/%2f/gi, '/'), n);
+		if (/%u[0-9a-f]{4}/i.test(f))
+			reach(
+				f.replace(/%u([0-9a-f]{4})/gi, function (m, h) {
+					return String.fromCharCode(parseInt(h, 16));
+				}),
+				n
+			);
 		if (/[?#]/.test(f)) reach(f.replace(/[?#][\s\S]*$/, ''), n);
 		if (f.indexOf(';') !== -1)
 			reach(
@@ -210,6 +224,31 @@ function readings(raw) {
 		if (f.indexOf('\\') !== -1) reach(f.replace(/\\/g, '/'), n);
 		if (f.indexOf('//') !== -1) reach(f.replace(/\/{2,}/g, '/'), n);
 		if (/\/\.\.?(?:\/|$)/.test(f)) reach(dots(f), n);
+	}
+	return out;
+}
+
+// The actions a router may take the request to name beside its readings, as
+// edge-core's routedAliases gives them: a script named mid-path (PATH_INFO), and
+// for a request that changes something, the name without its format suffix. They
+// count against the readings' segment budget.
+function routed(paths, unsafe) {
+	var sg = 0,
+		out = [],
+		i,
+		m;
+	for (i = 0; i < paths.length; i++) sg += paths[i].split('/').length - 1;
+	function add(p) {
+		if (paths.indexOf(p) !== -1 || out.indexOf(p) !== -1) return;
+		sg += p.split('/').length - 1;
+		if (sg > 512) throw 1;
+		out.push(p);
+	}
+	for (i = 0; i < paths.length; i++) {
+		m = /^(.*?\.(?:php|as[hmp]x))\//.exec(paths[i]);
+		if (m) add(m[1]);
+		m = paths[i].replace(/\.[^/]*$/, '');
+		if (unsafe && m !== paths[i]) add(m.replace(/([\s\S])\/$/, '$1'));
 	}
 	return out;
 }
