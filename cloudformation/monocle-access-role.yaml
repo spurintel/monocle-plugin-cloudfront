@@ -51,7 +51,6 @@ Resources:
             Action:
               - "cloudfront-keyvaluestore:DescribeKeyValueStore"
               - "cloudfront-keyvaluestore:GetKey"
-              - "cloudfront-keyvaluestore:ListKeys"
               - "cloudfront-keyvaluestore:UpdateKeys"
             Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:key-value-store/*"
           # The scheduler role invokes the verify Lambda for the hourly refresh.
@@ -219,12 +218,18 @@ Resources:
                   - "scheduler:UpdateSchedule"
                   - "scheduler:DeleteSchedule"
                 Resource: !Sub "arn:aws:scheduler:us-east-1:${AWS::AccountId}:schedule/default/monocle-crawlers-*"
-              # Lets EventBridge Scheduler invoke the Lambda; removed on teardown.
+              # Lets EventBridge Scheduler invoke the Lambda, and nothing else; removed on
+              # teardown.
               - Sid: LambdaInvokePermission
                 Effect: Allow
-                Action:
-                  - "lambda:AddPermission"
-                  - "lambda:RemovePermission"
+                Action: "lambda:AddPermission"
+                Resource: !Sub "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:monocle-verify-*"
+                Condition:
+                  StringEquals:
+                    "lambda:Principal": "scheduler.amazonaws.com"
+              - Sid: LambdaRemovePermission
+                Effect: Allow
+                Action: "lambda:RemovePermission"
                 Resource: !Sub "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:monocle-verify-*"
               - Sid: SchedulerServiceLinkedRole
                 Effect: Allow

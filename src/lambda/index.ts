@@ -19,7 +19,7 @@ import { loadConfig, type BakedConfig } from './config';
 import { refreshCrawlerRanges } from './crawler';
 import { edgeResponse, fromResponse, headerValue, jsonResponse, toHeaders, toRequest } from './http';
 import { createKvs } from './kvs';
-import { getRuntime } from './runtime';
+import { getRuntime, honoursClearance } from './runtime';
 import type { CloudFrontOriginRequestEvent, EdgeResponse, Kvs } from './types';
 
 export interface HandlerDeps {
@@ -92,12 +92,10 @@ export async function handleOriginRequest(
 	// A body CloudFront truncated is never handed to verify: a fragment would parse as a bad bundle.
 	if (request.body?.inputTruncated) return jsonResponse({ error: 'invalid' }, 413);
 
-	const readsClearance = canonicalPath === '/__mcl/verify' || canonicalPath === '/__mcl/state';
-	const runtime = await getRuntime(config, kvs, { freshClearance: readsClearance });
+	const runtime = await getRuntime(config, kvs);
 	// A store this container cannot read is ours to absorb. The clearance version is unknown,
 	// so verify gives the ten-minute pass it gives when Policy cannot answer, under the empty
-	// version the Function accepts for that pass alone; and what is built from defaults stays
-	// out of the shared cache.
+	// version the Function accepts for that pass alone.
 	const unread = runtime.live.unread === true;
 	const connectingIp = request.clientIp || null;
 	const distributionDomain = record.cf.config?.distributionDomainName?.toLowerCase();
@@ -115,11 +113,15 @@ export async function handleOriginRequest(
 	);
 	const response = await handleMclEndpoint(canonicalPath, {
 		runtime,
-		// The challenge page and the resident script sit in the CloudFront cache, so they are
-		// the shared kind: the session tag comes from /__mcl/state.
-		platform: unread
-			? { breaker: UNREAD_BREAKER }
-			: { breaker: containerBreaker(), sharedPages: { maxAgeSeconds: SCRIPT_CACHE_SECONDS } },
+		// The challenge page and the resident script sit in the CloudFront cache, which keeps even
+		// a no-store answer for its minimum TTL under a key without the query, so they are always
+		// the shared kind, carrying nothing of one visitor's. Built from defaults, they may be
+		// wrong for the site, so they are cached for no longer than that minimum.
+		platform: {
+			breaker: unread ? UNREAD_BREAKER : containerBreaker(),
+			sharedPages: { maxAgeSeconds: runtime.live.defaults ? 0 : SCRIPT_CACHE_SECONDS },
+			acceptsClearance: honoursClearance,
+		},
 		request: viewerRequest,
 		url: new URL(viewerRequest.url),
 		connectingIp,

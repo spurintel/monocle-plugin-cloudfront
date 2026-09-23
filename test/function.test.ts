@@ -245,6 +245,20 @@ describe('CloudFront Function (viewer-request)', () => {
 		}
 	});
 
+	// A Lambda goes on minting against the version it holds until its store window ends, so for
+	// two minutes a cookie on another version stands; one older than that is from before the
+	// rotation, which it revokes.
+	it('honours a cookie on another version minted in the last two minutes, and no older one', async () => {
+		const kv = baseKv({ 'p:/account': 'e' });
+		const fresh = await mintCookie(IP, 'allow', SECRET, { clearanceVersion: 'other' });
+		const event = viewerEvent({ uri: '/account', cookie: fresh });
+		expect(await loadHandler(kv)(event)).toBe(event.request);
+		// Minted three minutes ago: the allow's hour, less those minutes.
+		const older = await mintCookie(IP, 'allow', SECRET, { clearanceVersion: 'other', ttlSeconds: 3600 - 180 });
+		const refused = (await loadHandler(kv)(viewerEvent({ uri: '/account', cookie: older }))) as FnResponse;
+		expect(refused.statusCode).toBe(503);
+	});
+
 	it('rejects a tampered cookie and challenges', async () => {
 		const cookie = await mintCookie();
 		const [pt] = cookie.split('.');

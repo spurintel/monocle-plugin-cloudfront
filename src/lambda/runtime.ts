@@ -1,18 +1,22 @@
 /** Baked secrets and the live KVS config as the endpoint runtime, cached per container. */
 
 import {
+	ALLOW_TTL_SECONDS,
 	BLOCK_STATUSES,
+	BLOCK_TTL_SECONDS,
 	COOKIE_SCOPE,
 	coreScriptUrl,
 	createHmacSealer,
 	DEFAULT_CORE_HOST,
 	scriptSegment,
+	UNVERIFIED_PASS_SECONDS,
 	type BlockPageConfig,
 	type BlockStatus,
 	type EndpointRuntime,
+	type VerdictPayload,
 } from '@spur.us/monocle-edge-core';
 
-import { KVS_CACHE_MS } from '../shared/constants';
+import { KVS_CACHE_MS, ROTATION_GRACE_SECONDS } from '../shared/constants';
 import type { BakedConfig } from './config';
 import { readChunks } from './kvs';
 import type { Kvs } from './types';
@@ -29,6 +33,8 @@ export interface LiveConfig {
 	 * rest is defaults and the clearance version is unknown (empty).
 	 */
 	unread?: boolean;
+	/** Built without the store's config, so pages from it may be wrong for this site. */
+	defaults?: boolean;
 }
 
 export interface Runtime extends EndpointRuntime {
@@ -39,9 +45,10 @@ export interface Runtime extends EndpointRuntime {
 let cached: { until: number; identity: string; runtime: Runtime } | undefined;
 
 /**
- * `freshClearance` re-reads the clearance version inside the cache window. Verify mints
- * against it and state validates against it, and a container holding the one from before a
- * rotation mints cookies the Function refuses, or reports a fresh one as absent.
+ * The store is read at most once per cache window: each read is a billed KeyValueStore API
+ * call, and state is asked on every page view. A version rotated inside the window is
+ * absorbed by the Function, which honours a cookie minted in the last two minutes on another
+ * version, and by `honoursClearance`, which gives state and verify the same rule.
  *
  * A store that cannot be read is ours to absorb: the runtime this container last built stands,
  * whatever its age, with the clearance version if that much was read, since verify mints
@@ -51,15 +58,11 @@ let cached: { until: number; identity: string; runtime: Runtime } | undefined;
 export async function getRuntime(
 	baked: BakedConfig,
 	kvs: Kvs,
-	{ now = Date.now(), freshClearance = false }: { now?: number; freshClearance?: boolean } = {}
+	{ now = Date.now() }: { now?: number } = {}
 ): Promise<Runtime> {
 	const identity = `${baked.cookieSecret}|${baked.deploymentId}|${baked.publishableKey}|${baked.secretKey}`;
 	const held = cached && cached.identity === identity ? cached : undefined;
-	if (held && now < held.until) {
-		if (!freshClearance) return held.runtime;
-		const version = held.runtime.clearanceVersion;
-		if (((await kvs.get('cv').catch(() => version)) ?? '') === version) return held.runtime;
-	}
+	if (held && now < held.until) return held.runtime;
 
 	let cv: string | undefined, cfgRaw: string, hostsRaw: string;
 	try {
@@ -70,9 +73,12 @@ export async function getRuntime(
 		console.warn(`monocle store unreadable: ${error instanceof Error ? error.name : 'unknown'}`);
 		if (held && (cv === undefined || cv === held.runtime.clearanceVersion)) return held.runtime;
 		const live = held?.runtime.live;
-		return build(baked, cv ?? '', live?.cfgRaw ?? '{}', JSON.stringify(live?.hosts ?? []), cv === undefined);
+		return build(baked, cv ?? '', live?.cfgRaw ?? '{}', JSON.stringify(live?.hosts ?? baked.hosts ?? []), {
+			unread: cv === undefined,
+			defaults: !live,
+		});
 	}
-	const runtime = await build(baked, cv, cfgRaw, hostsRaw, false);
+	const runtime = await build(baked, cv, cfgRaw, hostsRaw, {});
 	cached = { until: now + KVS_CACHE_MS, identity, runtime };
 	return runtime;
 }
@@ -82,7 +88,7 @@ async function build(
 	cv: string,
 	cfgRaw: string,
 	hostsRaw: string,
-	unread: boolean
+	{ unread = false, defaults = false }: { unread?: boolean; defaults?: boolean }
 ): Promise<Runtime> {
 	let parsed: { session_tracking?: unknown; block_page?: unknown; custom_domain?: unknown } = {};
 	try {
@@ -109,6 +115,7 @@ async function build(
 		cfgRaw,
 		hosts,
 		...(unread && { unread }),
+		...(defaults && { defaults }),
 	};
 	const coreHost = customDomain ?? DEFAULT_CORE_HOST;
 	const runtime: Runtime = {
@@ -128,6 +135,19 @@ async function build(
 		scriptSegment: await scriptSegment(baked.deploymentId, customDomain),
 	};
 	return runtime;
+}
+
+/**
+ * The Function's rule for a verdict cookie on another clearance version, so state and verify
+ * answer as it does: the pass a container that could not read the store gives, an allow with at
+ * most ten minutes left, or a cookie minted in the last two minutes, by a container that had
+ * not yet read a rotation.
+ */
+export function honoursClearance(payload: VerdictPayload, nowSeconds: number): boolean {
+	if (payload.clearanceVersion === '')
+		return payload.verdict === 'allow' && payload.exp <= nowSeconds + UNVERIFIED_PASS_SECONDS;
+	const ttl = payload.verdict === 'allow' ? ALLOW_TTL_SECONDS : BLOCK_TTL_SECONDS;
+	return payload.exp > nowSeconds + ttl - ROTATION_GRACE_SECONDS;
 }
 
 /** The dashboard's `cfg.block_page`, in the shape the shared pages read. Anything else is the default page. */

@@ -14,6 +14,8 @@ export interface BakedConfig {
 	publishableKey: string;
 	deploymentId: string;
 	kvsArn: string;
+	/** The deployment's hosts when it was deployed: verify's Origin list while the store cannot be read. */
+	hosts?: string[];
 }
 
 let cached: BakedConfig | null = null;

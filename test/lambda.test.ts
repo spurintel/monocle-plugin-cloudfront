@@ -17,7 +17,7 @@ import type { BakedConfig } from '../src/lambda/config';
 import { CRAWLER_FEEDS, refreshCrawlerRanges } from '../src/lambda/crawler';
 import { handleOriginRequest, handler } from '../src/lambda/index';
 import { MemoryKvs, readChunks, writeChunks } from '../src/lambda/kvs';
-import { getRuntime, resetRuntimeCache } from '../src/lambda/runtime';
+import { getRuntime, honoursClearance, resetRuntimeCache } from '../src/lambda/runtime';
 import { createHmacSealer } from '@spur.us/monocle-edge-core';
 
 const SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
@@ -422,9 +422,23 @@ describe('fixes from the audit', () => {
 		expect(policy.mock.calls.length).toBe(asked);
 	});
 
-	// Verify mints against the clearance version. A container still holding the one
-	// from before a rotation minted cookies the Function refuses.
-	it('mints against a clearance version rotated inside the cache window', async () => {
+	// Every read is a billed KeyValueStore API call, and state is asked on every page view.
+	it('reads the store once per cache window, however often state and verify are asked', async () => {
+		vi.stubGlobal('fetch', vi.fn(async () => policyResponse(true)));
+		const kvs = liveKvs();
+		const deps = { config: BAKED, kvs };
+		await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), deps);
+		const get = vi.spyOn(kvs, 'get');
+		for (let i = 0; i < 5; i++) {
+			await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), deps);
+			await handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), deps);
+		}
+		expect(get).not.toHaveBeenCalled();
+	});
+
+	// Until its window ends a container mints against the version it holds. The Function, and
+	// state and verify through honoursClearance, stand such a cookie for two minutes.
+	it('mints against the version it holds, which the edge honours across a rotation', async () => {
 		vi.stubGlobal('fetch', vi.fn(async () => policyResponse(true)));
 		const kvs = liveKvs();
 		const deps = { config: BAKED, kvs };
@@ -432,16 +446,20 @@ describe('fixes from the audit', () => {
 		const rotated = 'cd'.repeat(32);
 		kvs.store.cv = rotated;
 		const result = await handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), deps);
-		const value = cookieValue(setCookies(result)[0]!, COOKIE_SCOPE.names.verdict);
-		const state = await validateVerdictCookie({
-			sealer: createHmacSealer(SECRET),
-			audience: ID,
-			cookieValue: value,
-			ipBinding: IP,
-			nowSeconds: Math.floor(Date.now() / 1000),
-			clearanceVersion: rotated,
-		});
-		expect(state.status).toBe('allow');
+		const nowSeconds = Math.floor(Date.now() / 1000);
+		const read = (at: number, acceptsVersion?: typeof honoursClearance) =>
+			validateVerdictCookie({
+				sealer: createHmacSealer(SECRET),
+				audience: ID,
+				cookieValue: cookieValue(setCookies(result)[0]!, COOKIE_SCOPE.names.verdict),
+				ipBinding: IP,
+				nowSeconds: at,
+				clearanceVersion: rotated,
+				acceptsVersion,
+			});
+		expect((await read(nowSeconds, honoursClearance)).status).toBe('allow');
+		expect((await read(nowSeconds)).status).toBe('absent');
+		expect((await read(nowSeconds + 121, honoursClearance)).status).toBe('absent');
 	});
 
 	// A store that cannot be read is ours. A container with a runtime keeps using it, however old;
@@ -452,7 +470,6 @@ describe('fixes from the audit', () => {
 		const first = await getRuntime(BAKED, kvs, { now: 1_000 });
 		vi.spyOn(kvs, 'get').mockRejectedValue(new Error('ThrottlingException'));
 		expect(await getRuntime(BAKED, kvs, { now: 1_000 + 3_600_000 })).toBe(first);
-		expect(await getRuntime(BAKED, kvs, { now: 1_000 + 3_600_000, freshClearance: true })).toBe(first);
 	});
 
 	// The version was read and then the rest failed. The one held is from before a rotation, so
@@ -482,10 +499,15 @@ describe('fixes from the audit', () => {
 		expect(
 			(await handleOriginRequest(originEvent({ uri: `/__mcl/${segment}/mcl.js`, method: 'GET' }), deps)).status
 		).toBe('200');
-		// Built from defaults, so kept out of the shared cache.
-		const page = await handleOriginRequest(originEvent({ uri: '/__mcl/challenge', method: 'GET' }), deps);
-		expect(page.headers?.['cache-control']?.[0]?.value).toMatch(/no-store/);
-		expect(page.headers?.['cache-control']?.[0]?.value).not.toMatch(/public/);
+		// CloudFront caches even a no-store page for its minimum TTL, under a key without the
+		// query, so the page carries nothing of this visitor's; built from defaults, it is cached
+		// for no longer than that.
+		const page = await handleOriginRequest(
+			originEvent({ uri: '/__mcl/challenge', method: 'GET', querystring: 'return=%2Freset%3Ftoken%3DSECRET' }),
+			deps
+		);
+		expect(page.headers?.['cache-control']?.[0]?.value).toBe('public, max-age=0');
+		expect(page.body).not.toContain('SECRET');
 		expect((await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), deps)).status).toBe('200');
 		const policy = vi.fn();
 		vi.stubGlobal('fetch', policy);
@@ -502,6 +524,35 @@ describe('fixes from the audit', () => {
 			clearanceVersion: '',
 		});
 		expect(pass.status).toBe('allow');
+	});
+
+	// The version was read, so verify asks Policy as usual; only the pages are built from defaults.
+	it('caches pages for no time when the store gave its version but not its config', async () => {
+		const kvs = liveKvs();
+		const read = kvs.get.bind(kvs);
+		vi.spyOn(kvs, 'get').mockImplementation(async (key: string) => {
+			if (key === 'cv') return read(key);
+			throw new Error('ThrottlingException');
+		});
+		const deps = { config: BAKED, kvs };
+		const page = await handleOriginRequest(originEvent({ uri: '/__mcl/challenge', method: 'GET' }), deps);
+		expect(page.headers?.['cache-control']?.[0]?.value).toBe('public, max-age=0');
+		const policy = vi.fn(async () => policyResponse(true));
+		vi.stubGlobal('fetch', policy);
+		expect((await handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), deps)).status).toBe('200');
+		expect(policy).toHaveBeenCalled();
+	});
+
+	// Without the store's host list only the distribution's own name would be a same-origin
+	// Origin, and a browser that sends no Sec-Fetch-Site could not verify on the site's own name.
+	it('checks verify against the hosts baked at deploy when the store cannot be read', async () => {
+		const kvs = liveKvs();
+		vi.spyOn(kvs, 'get').mockRejectedValue(new Error('ThrottlingException'));
+		const result = await handleOriginRequest(
+			originEvent({ body: { captchaData: 'bundle' }, distributionDomainName: 'd111.cloudfront.net' }),
+			{ config: { ...BAKED, hosts: ['www.example.com'] }, kvs }
+		);
+		expect(result.status).toBe('200');
 	});
 
 	// CloudFront keeps one cache entry for GET and HEAD, so a HEAD must not fill the cached

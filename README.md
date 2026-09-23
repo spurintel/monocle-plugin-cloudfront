@@ -37,12 +37,15 @@ returns once; an assessed path then serves them, and an enforced path ignores it
 CloudFront hides the `Upgrade` header from edge functions, so the Function recognises a
 WebSocket handshake by its `Sec-WebSocket-Key`.
 
-The Lambda reads the KeyValueStore through its API, which can be throttled while the
-Function's edge copy still answers. A container keeps the runtime it last built, however old,
-when the store cannot be read, taking the clearance version if that much was read. A cold one
-serves every page on defaults, kept out of the shared cache, and verify gives the ten-minute
+The Lambda reads the KeyValueStore through its API, a billed call that can be throttled while
+the Function's edge copy still answers, so each container reads it at most once a minute. After
+a rotation a container can go on minting against the version it holds for that minute, so the
+Function, and state and verify, stand a cookie on another version while it is at most two
+minutes old. A container keeps the runtime it last built, however old, when the store cannot be
+read, taking the clearance version if that much was read. A cold one serves every page on
+defaults, cached for no longer than CloudFront's minimum TTL, and verify gives the ten-minute
 pass it gives when Policy cannot answer, under an empty clearance version. The Function accepts
-that version for an allow of ten minutes or less, and for nothing else.
+that version for an allow with at most ten minutes left.
 
 The Function protects every hostname the distribution serves. CloudFront routes on the Host,
 so an alias the deployment does not list, or the `*.cloudfront.net` name, reaches the same

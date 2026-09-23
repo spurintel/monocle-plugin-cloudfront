@@ -154,6 +154,7 @@ function readings(raw) {
 		at = [0],
 		pending = [raw],
 		out = [],
+		sg = 0,
 		f,
 		n,
 		r,
@@ -170,11 +171,11 @@ function readings(raw) {
 		n = at[seen.indexOf(f)];
 		if (/[\x00-\x1f\x7f]/.test(f)) throw 1;
 		r = true;
-		if (/%[0-9a-f]{2}/i.test(f)) {
+		if (/%(?:2[0-9a-e]|[013-9a-f][0-9a-f])/i.test(f)) {
 			if (n === 2) throw 1;
 			d = null;
 			try {
-				d = f.replace(/(?:%[0-9a-f]{2})+/gi, decodeURIComponent);
+				d = f.replace(/(?:%(?:2[0-9a-e]|[013-9a-f][0-9a-f]))+/gi, decodeURIComponent);
 			} catch (e) {
 				if (n === 0) throw 1;
 			}
@@ -188,9 +189,14 @@ function readings(raw) {
 				return s.toLowerCase();
 			});
 			if (d.length > 1 && d.charAt(d.length - 1) === '/') d = d.slice(0, -1);
-			if (out.indexOf(d) === -1) out.push(d);
+			if (out.indexOf(d) === -1) {
+				sg += d.split('/').length - 1;
+				if (sg > 512) throw 1;
+				out.push(d);
+			}
 		}
-		if (/[?#]/.test(f)) reach(f.replace(/[?#].*$/, ''), n);
+		if (/%2f/i.test(f)) reach(f.replace(/%2f/gi, '/'), n);
+		if (/[?#]/.test(f)) reach(f.replace(/[?#][\s\S]*$/, ''), n);
 		if (f.indexOf(';') !== -1)
 			reach(
 				f
@@ -323,9 +329,11 @@ function openVerdict(sealed, key, aud, cv, bind) {
 		typeof p.jti !== 'string' ||
 		!p.jti ||
 		p.jti.length > 128 ||
-		// An empty version is a Lambda that could not read the store giving the ten-minute pass
-		// it gives when Policy cannot answer: an allow, and never a longer one.
-		(p.clearanceVersion !== cv && !(p.clearanceVersion === '' && p.verdict === 'allow' && p.exp <= now + 600)) ||
+		// Another version stands only as the pass a Lambda that could not read the store gives, an
+		// allow with at most ten minutes left, or when minted in the last two minutes, by a Lambda
+		// that had not yet read a rotation.
+		(p.clearanceVersion !== cv &&
+			!(p.clearanceVersion === '' ? p.verdict === 'allow' && p.exp <= now + 600 : p.exp > now + ttl - 120)) ||
 		now >= p.exp ||
 		p.ip !== bind
 	)
@@ -518,8 +526,8 @@ function refuse(req, method, nav, ws, safe, uri) {
 }
 
 /**
- * Whether a blocked navigation may be sent to the configured page. The rule is
- * edge-core's safeReturn: a path on this host, never protocol-relative and never
+ * Whether a blocked navigation may be sent to the configured page. The rule is the one
+ * edge-core's safeReturn applies to a return path: a path on this host, never protocol-relative and never
  * one a browser folds into an off-site address (`/\\evil.example` resolves to
  * `https://evil.example/`). A target inside an enforced subtree is refused as
  * well, because blocking it would redirect to itself for ever.
