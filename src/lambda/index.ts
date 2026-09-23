@@ -92,7 +92,11 @@ export async function handleOriginRequest(
 	// A body CloudFront truncated is never handed to verify: a fragment would parse as a bad bundle.
 	if (request.body?.inputTruncated) return jsonResponse({ error: 'invalid' }, 413);
 
-	const runtime = await getRuntime(config, kvs, { freshClearance: canonicalPath === '/__mcl/verify' });
+	const readsClearance = canonicalPath === '/__mcl/verify' || canonicalPath === '/__mcl/state';
+	const runtime = await getRuntime(config, kvs, { freshClearance: readsClearance });
+	// With the clearance version unknown, a cookie minted or read now is one the Function
+	// would refuse, which loops the visitor. The pages that need no store still answer.
+	if (runtime.live.unread && readsClearance) return jsonResponse({ error: 'unavailable' }, 503);
 	const connectingIp = request.clientIp || null;
 	const distributionDomain = record.cf.config?.distributionDomainName?.toLowerCase();
 	// The deployment's hosts, plus the distribution's own domain. Never the origin-request Host,

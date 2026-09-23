@@ -29,18 +29,24 @@ async function handler(event) {
 		} catch (e) {
 			return resp(400, H('text/plain; charset=utf-8'), '');
 		}
-		// Each reading an origin might serve is resolved and the strictest stands:
-		// enforced if any is, an infrastructure pass only if all are.
+		// Each reading an origin might serve is resolved and the strictest stands, as
+		// edge-core decides them one by one: enforced if any is, an infrastructure
+		// pass only if every covered reading is infrastructure, and an assessed
+		// reading that is not (asm) still challenges where an enforced one passes.
 		// The runtime rejects `await` in an argument position, so it stands alone.
 		var wRaw = await readChunks(kvs, 'w');
 		var w = wild(wRaw),
 			hit = null,
-			inf = true;
+			inf = true,
+			asm = false;
 		for (var i = 0; i < paths.length; i++) {
 			if (paths[i] === '/__mcl' || paths[i].indexOf('/__mcl/') === 0) return resp(404, H(), null);
 			var h = await resolve(kvs, paths[i], w);
 			if (h === 'e' || !hit) hit = h;
-			if (!infra(paths[i])) inf = false;
+			if (h && !infra(paths[i])) {
+				inf = false;
+				if (h === 'a') asm = true;
+			}
 		}
 		if (!hit) return req;
 		var method = (req.method || 'GET').toUpperCase();
@@ -61,6 +67,11 @@ async function handler(event) {
 		// inconsistent; the fix is the missing keys, never a challenge loop.
 		if (!id || !cv) return skip(req, 'config');
 		var verdict = held ? openVerdict(held, key, id, cv, bind) : null;
+		// An assessed path only ever wanted to observe, so it challenges only a
+		// visitor the challenge can help: not an unbindable address, and not one
+		// whose challenge page left its marker that our script failed them. The
+		// marker is theirs to forge, and is read nowhere a verdict is required.
+		var chal = !verdict && nav && safe && bind && !skipped;
 		if (safe && !ws) {
 			var botsRaw = await readChunks(kvs, 'bots');
 			if (botsRaw && inPacked(ip, botsRaw)) return req;
@@ -71,7 +82,7 @@ async function handler(event) {
 		// OPTIONS here needs a verdict like any other method.
 		if (hit === 'e') {
 			var ipsRaw = await readChunks(kvs, 'ips');
-			if (ipsRaw && inPacked(ip, ipsRaw)) return req;
+			if (ipsRaw && inPacked(ip, ipsRaw) && !(asm && chal)) return req;
 			if (verdict === 'block') return await blockResp(kvs, req, nav, method, w);
 			if (verdict === 'allow') return req;
 			// Refused only for want of a verdict. Verify gives every visitor one
@@ -79,11 +90,7 @@ async function handler(event) {
 			// Lambda passes them.
 			return refuse(req, method, nav, ws, safe, uri);
 		}
-		// An assessed path only ever wanted to observe, so it serves a visitor the
-		// challenge cannot help: an unbindable address, or the challenge page's
-		// marker that our script failed them. The marker is theirs to forge, and
-		// is read nowhere else.
-		if (!verdict && nav && safe && bind && !skipped) return bounce(503, challenge(uri, qstr(req.querystring)), method, 1);
+		if (chal) return bounce(503, challenge(uri, qstr(req.querystring)), method, 1);
 		return req;
 	} catch (e) {
 		return skip(req, 'error');
@@ -361,10 +368,10 @@ function v6hex(addr) {
 	}
 	var dc = addr.indexOf('::');
 	if (dc !== addr.lastIndexOf('::')) return null;
-	var head = (dc === -1 ? addr : addr.slice(0, dc)).split(':');
-	var tail = dc === -1 ? [] : addr.slice(dc + 2).split(':');
-	if (head[0] === '') head = [];
-	if (tail[0] === '') tail = [];
+	var hs = dc === -1 ? addr : addr.slice(0, dc),
+		ts = dc === -1 ? '' : addr.slice(dc + 2);
+	var head = hs === '' ? [] : hs.split(':');
+	var tail = ts === '' ? [] : ts.split(':');
 	var n = head.length + tail.length,
 		g = [],
 		i,
@@ -486,8 +493,14 @@ function bounce(code, to, method, retry) {
 	);
 }
 
+// A lone surrogate cannot be encoded, and a throw here would become the
+// catch-all's pass; the visitor is sent home after the challenge instead.
 function challenge(path, qs) {
-	return '/__mcl/challenge?return=' + encodeURIComponent(path + qs);
+	try {
+		return '/__mcl/challenge?return=' + encodeURIComponent(path + qs);
+	} catch (e) {
+		return '/__mcl/challenge?return=%2F';
+	}
 }
 
 // `uri` is the request's own path, not the canonical one: the canonical form is

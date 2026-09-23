@@ -24,6 +24,11 @@ export interface LiveConfig {
 	clearanceVersion: string;
 	cfgRaw: string;
 	hosts: string[];
+	/**
+	 * The store could not be read and this container had nothing to fall back on, so the
+	 * rest is defaults. The clearance version is unknown: nothing may be minted or validated.
+	 */
+	unread?: boolean;
 }
 
 export interface Runtime extends EndpointRuntime {
@@ -35,8 +40,11 @@ let cached: { until: number; identity: string; runtime: Runtime } | undefined;
 
 /**
  * `freshClearance` re-reads the clearance version inside the cache window. Verify mints
- * against it, and a container holding the one from before a rotation mints cookies the
- * Function refuses, sending a visitor who has just passed back to the challenge.
+ * against it and state validates against it, and a container holding the one from before a
+ * rotation mints cookies the Function refuses, or reports a fresh one as absent.
+ *
+ * A store that cannot be read is ours to absorb: the runtime this container last built stands,
+ * whatever its age. A container with none gets defaults marked `unread`.
  */
 export async function getRuntime(
 	baked: BakedConfig,
@@ -44,17 +52,35 @@ export async function getRuntime(
 	{ now = Date.now(), freshClearance = false }: { now?: number; freshClearance?: boolean } = {}
 ): Promise<Runtime> {
 	const identity = `${baked.cookieSecret}|${baked.deploymentId}|${baked.publishableKey}|${baked.secretKey}`;
-	if (cached && cached.identity === identity && now < cached.until) {
-		if (!freshClearance) return cached.runtime;
-		// A store that cannot answer now leaves the version this container holds standing,
-		// rather than failing verify for the visitor.
-		const held = cached.runtime.clearanceVersion;
-		if (((await kvs.get('cv').catch(() => held)) ?? '') === held) return cached.runtime;
+	const held = cached && cached.identity === identity ? cached : undefined;
+	if (held && now < held.until) {
+		if (!freshClearance) return held.runtime;
+		const version = held.runtime.clearanceVersion;
+		if (((await kvs.get('cv').catch(() => version)) ?? '') === version) return held.runtime;
 	}
 
-	const cv = (await kvs.get('cv')) ?? '';
-	const cfgRaw = (await readChunks(kvs, 'cfg')) ?? '{}';
-	const hostsRaw = (await readChunks(kvs, 'hosts')) ?? '[]';
+	let cv: string, cfgRaw: string, hostsRaw: string;
+	try {
+		cv = (await kvs.get('cv')) ?? '';
+		cfgRaw = (await readChunks(kvs, 'cfg')) ?? '{}';
+		hostsRaw = (await readChunks(kvs, 'hosts')) ?? '[]';
+	} catch (error) {
+		console.warn(`monocle store unreadable: ${error instanceof Error ? error.name : 'unknown'}`);
+		if (held) return held.runtime;
+		return build(baked, '', '{}', '[]', true);
+	}
+	const runtime = await build(baked, cv, cfgRaw, hostsRaw, false);
+	cached = { until: now + KVS_CACHE_MS, identity, runtime };
+	return runtime;
+}
+
+async function build(
+	baked: BakedConfig,
+	cv: string,
+	cfgRaw: string,
+	hostsRaw: string,
+	unread: boolean
+): Promise<Runtime> {
 	let parsed: { session_tracking?: unknown; block_page?: unknown; custom_domain?: unknown } = {};
 	try {
 		parsed = JSON.parse(cfgRaw) as typeof parsed;
@@ -79,6 +105,7 @@ export async function getRuntime(
 		clearanceVersion: cv,
 		cfgRaw,
 		hosts,
+		...(unread && { unread }),
 	};
 	const coreHost = customDomain ?? DEFAULT_CORE_HOST;
 	const runtime: Runtime = {
@@ -97,7 +124,6 @@ export async function getRuntime(
 		coreScriptUrl: coreScriptUrl(coreHost, baked.publishableKey),
 		scriptSegment: await scriptSegment(baked.deploymentId, customDomain),
 	};
-	cached = { until: now + KVS_CACHE_MS, identity, runtime };
 	return runtime;
 }
 

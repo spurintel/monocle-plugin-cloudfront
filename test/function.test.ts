@@ -372,6 +372,36 @@ describe('CloudFront Function (viewer-request)', () => {
 		expect(result.statusCode).toBe(503);
 	});
 
+	// Edge-core decides each reading on its own and keeps the strictest. An allow-listed address
+	// passes an enforced reading, and still meets the challenge an assessed one asks for.
+	it('challenges an allow-listed address when another reading is only assessed', async () => {
+		const packed = packCidrSet([IP]);
+		const kv = baseKv({ 's:/': 'a', 's:/account': 'e', ips: JSON.stringify(packed) });
+		const handler = loadHandler(kv);
+		const plain = viewerEvent({ uri: '/account/x' });
+		expect(await handler(plain)).toBe(plain.request);
+		const twoWays = (await handler(viewerEvent({ uri: '//account/x' }))) as FnResponse;
+		expect(twoWays.statusCode).toBe(503);
+		expect(twoWays.body).toContain('/__mcl/challenge?return=');
+	});
+
+	// Only a reading something covers counts against the infrastructure pass.
+	it('passes an infrastructure path whose other readings nothing covers', async () => {
+		const kv = baseKv({ 's:/': '', 's:/.well-known': 'a' });
+		delete kv['s:/'];
+		const event = viewerEvent({ uri: '/.well-known/../foo' });
+		expect(await loadHandler(kv)(event)).toBe(event.request);
+	});
+
+	// Read leniently, `:1::` was `::`, and a cookie bound to that /64 opened for it.
+	it('reads a malformed IPv6 head as edge-core does, unbindable', async () => {
+		const cookie = await mintCookie('::1');
+		const result = (await loadHandler(baseKv({ 'p:/account': 'e' }))(
+			viewerEvent({ uri: '/account', cookie, ip: ':1::' })
+		)) as FnResponse;
+		expect(result.statusCode).toBe(503);
+	});
+
 	// Edge-core reads an IPv4-mapped address as the IPv4 one, and the Lambda mints for that.
 	it('binds an IPv4-mapped address as edge-core does', async () => {
 		for (const ip of ['::ffff:203.0.113.9', '::ffff:cb00:7109']) {

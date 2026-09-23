@@ -4,6 +4,7 @@ import {
 	COOKIE_SCOPE,
 	evaluateForEdge,
 	FAILURE_THRESHOLD,
+	mintVerdictCookie,
 	packCidrSet,
 	safeReturn,
 	scriptSegment,
@@ -16,7 +17,7 @@ import type { BakedConfig } from '../src/lambda/config';
 import { CRAWLER_FEEDS, refreshCrawlerRanges } from '../src/lambda/crawler';
 import { handleOriginRequest, handler } from '../src/lambda/index';
 import { MemoryKvs, readChunks, writeChunks } from '../src/lambda/kvs';
-import { resetRuntimeCache } from '../src/lambda/runtime';
+import { getRuntime, resetRuntimeCache } from '../src/lambda/runtime';
 import { createHmacSealer } from '@spur.us/monocle-edge-core';
 
 const SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
@@ -443,6 +444,59 @@ describe('fixes from the audit', () => {
 		expect(state.status).toBe('allow');
 	});
 
+	// A store that cannot be read is ours. A container with a runtime keeps using it, however old;
+	// one without still serves every page that needs no store, and refuses only to mint or read a
+	// cookie without the clearance version, which would loop the visitor.
+	it('keeps the last runtime, whatever its age, when the store cannot be read', async () => {
+		const kvs = liveKvs();
+		const first = await getRuntime(BAKED, kvs, { now: 1_000 });
+		vi.spyOn(kvs, 'get').mockRejectedValue(new Error('ThrottlingException'));
+		expect(await getRuntime(BAKED, kvs, { now: 1_000 + 3_600_000 })).toBe(first);
+		expect(await getRuntime(BAKED, kvs, { now: 1_000 + 3_600_000, freshClearance: true })).toBe(first);
+	});
+
+	it('serves the pages that need no store on a cold container that cannot read it', async () => {
+		const kvs = liveKvs();
+		vi.spyOn(kvs, 'get').mockRejectedValue(new Error('ThrottlingException'));
+		const deps = { config: BAKED, kvs };
+		for (const uri of ['/__mcl/challenge', '/__mcl/resubmit', '/__mcl/blocked'])
+			expect((await handleOriginRequest(originEvent({ uri, method: 'GET' }), deps)).status, uri).toMatch(/^(200|403)$/);
+		const segment = await scriptSegment(ID);
+		expect(
+			(await handleOriginRequest(originEvent({ uri: `/__mcl/${segment}/mcl.js`, method: 'GET' }), deps)).status
+		).toBe('200');
+		expect((await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), deps)).status).toBe('503');
+		const verify = await handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), deps);
+		expect(verify.status).toBe('503');
+		expect(setCookies(verify)).toEqual([]);
+	});
+
+	// Another container's verify minted against the rotated version; the challenge page asks
+	// this one, still holding the old version, to confirm the cookie.
+	it('reads a cookie minted against a clearance version rotated inside the cache window', async () => {
+		const kvs = liveKvs();
+		const deps = { config: BAKED, kvs };
+		await handleOriginRequest(originEvent({ uri: '/__mcl/challenge', method: 'GET' }), deps);
+		const rotated = 'cd'.repeat(32);
+		kvs.store.cv = rotated;
+		const minted = await mintVerdictCookie({
+			sealer: createHmacSealer(SECRET),
+			audience: ID,
+			scope: COOKIE_SCOPE,
+			ipBinding: IP,
+			verdict: 'allow',
+			sid: 'sid-1',
+			jti: 'jti-1',
+			nowSeconds: Math.floor(Date.now() / 1000),
+			clearanceVersion: rotated,
+		});
+		const state = await handleOriginRequest(
+			originEvent({ uri: '/__mcl/state', method: 'GET', headers: { Cookie: minted.setCookie.split(';')[0]! } }),
+			deps
+		);
+		expect(JSON.parse(state.body ?? '{}').hint.verdict).toBe('allow');
+	});
+
 	// A verify already warm in this container keeps the version it holds when the store
 	// cannot answer the re-read, rather than failing the visitor.
 	it('verifies against the cached clearance version when the store cannot be read', async () => {
@@ -493,6 +547,27 @@ describe('fixes from the audit', () => {
 			{ config: BAKED, kvs }
 		);
 		expect(JSON.parse(again.body ?? '{}').sid).toBe(sid);
+	});
+
+	// One UpdateKeys call takes 50 keys, and the refresh writes the snapshot in one call.
+	it('refuses a crawler snapshot too large for one store update', async () => {
+		// Every other /64, so no two ranges merge when packed, and within edge-core's 1,000.
+		const huge = Array.from({ length: 900 }, (_, i) => `2001:db8:0:${(i * 2).toString(16)}::/64`);
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async (url: string) =>
+				new Response(
+					JSON.stringify({
+						creationTime: new Date().toISOString(),
+						prefixes: url.includes('bing')
+							? [{ ipv4Prefix: '157.55.39.0/24' }]
+							: huge.map((ipv6Prefix) => ({ ipv6Prefix })),
+					}),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				)
+			)
+		);
+		await expect(refreshCrawlerRanges(new MemoryKvs())).rejects.toThrow(/one store update/);
 	});
 
 	it('writeChunks removes every stale continuation key', async () => {

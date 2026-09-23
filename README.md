@@ -37,6 +37,12 @@ returns once; an assessed path then serves them, and an enforced path ignores it
 CloudFront hides the `Upgrade` header from edge functions, so the Function recognises a
 WebSocket handshake by its `Sec-WebSocket-Key`.
 
+The Lambda reads the KeyValueStore through its API, which can be throttled while the
+Function's edge copy still answers. A container keeps the runtime it last built, however old,
+when the store cannot be read. A cold one serves the challenge, resubmit and block pages and the
+script on defaults, and answers 503 only to state and verify, which cannot read or mint a cookie
+without the clearance version.
+
 The Function protects every hostname the distribution serves. CloudFront routes on the Host,
 so an alias the deployment does not list, or the `*.cloudfront.net` name, reaches the same
 origin and is the same site. `OPTIONS` needs a verdict on an enforced path like any other
