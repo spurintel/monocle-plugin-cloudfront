@@ -14,7 +14,7 @@ import {
 } from '@spur.us/monocle-edge-core';
 
 import { SCRIPT_CACHE_SECONDS } from '../shared/constants';
-import { persistingBreaker } from './breaker';
+import { containerBreaker } from './breaker';
 import { loadConfig, type BakedConfig } from './config';
 import { refreshCrawlerRanges } from './crawler';
 import { edgeResponse, fromResponse, headerValue, jsonResponse, toHeaders, toRequest } from './http';
@@ -104,7 +104,7 @@ export async function handleOriginRequest(
 		runtime,
 		// The challenge page and the resident script sit in the CloudFront cache, so they are
 		// the shared kind: the session tag comes from /__mcl/state.
-		platform: { breaker: persistingBreaker(kvs), sharedPages: { maxAgeSeconds: SCRIPT_CACHE_SECONDS } },
+		platform: { breaker: containerBreaker(), sharedPages: { maxAgeSeconds: SCRIPT_CACHE_SECONDS } },
 		request: viewerRequest,
 		url: new URL(viewerRequest.url),
 		connectingIp,

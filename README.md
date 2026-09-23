@@ -16,7 +16,7 @@ Two runtimes split the work (see `src/`):
 | | CloudFront Function (`src/function/index.js`) | Lambda@Edge (`src/lambda/`) |
 |---|---|---|
 | Trigger | viewer-request on the default behavior and every customer behavior | origin-request on the `/__mcl/*` behaviors only |
-| Job | the guard ladder: path readings, verdict cookie, crawler and allow-list passes, breaker, refusal shells | `/__mcl/state`, `/__mcl/verify` (Policy call and cookie minting), the challenge, resubmit and block pages, the resident script, the hourly crawler refresh |
+| Job | the guard ladder: path readings, verdict cookie, crawler and allow-list passes, refusal shells | `/__mcl/state`, `/__mcl/verify` (Policy call and cookie minting), the challenge, resubmit and block pages, the resident script, the hourly crawler refresh |
 | Cost and latency | sub-millisecond, runs on every request | runs only inside the challenge flow |
 
 **Flow**: a visitor without a valid decision opens an assessed page. The Function answers
@@ -26,7 +26,9 @@ an HMAC-sealed `__Host-mcl_c` cookie (allow one hour, block ten minutes), the pa
 the return path, and the Function passes the request through to **cache and origin
 untouched**. Enforced paths refuse a cookieless request by shape (challenge shell, resubmit
 shell, challenge JSON, or an empty 403 for WebSockets) and answer a block verdict with the
-customer's block page, redirect or JSON.
+customer's block page, redirect or JSON. When Policy cannot answer a verify (down, erroring,
+refusing our key or too slow), the Lambda passes the visitor for ten minutes instead: our
+failure never answers them, and nothing about it is written to the store.
 
 The Function protects every hostname the distribution serves. CloudFront routes on the Host,
 so an alias the deployment does not list, or the `*.cloudfront.net` name, reaches the same
@@ -73,7 +75,7 @@ viewer's Origin, Cookie and Sec-Fetch headers.
 
 Session tracking differs from the Worker in one place. The Worker tags the core URL with
 `cpd=<sid>` when it serves the challenge page or resident script; here both are cached and
-identical for every visitor, so `GET /__mcl/state` returns `{hint, degraded, sid}`, mints
+identical for every visitor, so `GET /__mcl/state` returns `{hint, sid}`, mints
 the session cookie when tracking is on and none is held, and the scripts append `cpd`
 themselves before loading the core. The session cookie is attribution only.
 
@@ -92,7 +94,6 @@ themselves before loading the core. The session cookie is attribution only.
 | `p:<path>` | `e` enforced exact, `a` assessed exact | dashboard |
 | `s:<prefix>` | `e` enforced subtree, `a` assessed subtree | dashboard |
 | `bots` | packed crawler ranges plus `expiresAt` | Lambda, hourly |
-| `brk` | breaker open-until epoch seconds | Lambda, whenever the deadline moves |
 
 Route resolution is a walk: for `/a/b/c` the Function reads `p:/a/b/c`, then `s:/a/b/c`,
 `s:/a/b`, `s:/a`, `s:/`, then scans `w`. Enforcement applies if any `e` matches; assessment

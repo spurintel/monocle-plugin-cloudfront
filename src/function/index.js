@@ -70,18 +70,11 @@ async function handler(event) {
 			if (ipsRaw && inPacked(ip, ipsRaw)) return req;
 			if (verdict === 'block') return await blockResp(kvs, req, nav, method);
 			if (verdict === 'allow') return req;
-			var brk = await g(kvs, 'brk');
-			if (brk && Math.floor(Date.now() / 1000) < parseInt(brk, 10)) {
-				req.headers['x-monocle-degraded'] = { value: '1' };
-				return req;
-			}
+			// Refused only for want of a verdict, which verify always gives: when
+			// Policy cannot answer, the Lambda passes the visitor there.
 			return refuse(req, method, nav, ws, safe, uri);
 		}
-		if (!verdict && nav && safe) {
-			var brk2 = await g(kvs, 'brk');
-			if (!(brk2 && Math.floor(Date.now() / 1000) < parseInt(brk2, 10)))
-				return bounce(503, challenge(uri, qstr(req.querystring)), method, 1);
-		}
+		if (!verdict && nav && safe) return bounce(503, challenge(uri, qstr(req.querystring)), method, 1);
 		return req;
 	} catch (e) {
 		return skip(req, 'error');

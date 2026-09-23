@@ -3,14 +3,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	COOKIE_SCOPE,
 	evaluateForEdge,
-	OPEN_GRACE_MS,
+	FAILURE_THRESHOLD,
 	packCidrSet,
 	safeReturn,
 	scriptSegment,
+	UNVERIFIED_PASS_SECONDS,
 	validateVerdictCookie,
 } from '@spur.us/monocle-edge-core';
 
-import { persistingBreaker, resetBreaker } from '../src/lambda/breaker';
+import { resetBreaker } from '../src/lambda/breaker';
 import type { BakedConfig } from '../src/lambda/config';
 import { CRAWLER_FEEDS, refreshCrawlerRanges } from '../src/lambda/crawler';
 import { handleOriginRequest, handler } from '../src/lambda/index';
@@ -394,42 +395,30 @@ describe('fixes from the audit', () => {
 		expect(JSON.parse(result.body ?? '{}').error).toBe('origin');
 	});
 
-	it('persists the breaker on transitions only', async () => {
-		vi.stubGlobal(
-			'fetch',
-			vi.fn(async () => new Response('down', { status: 503 }))
-		);
+	// Our failure never answers the visitor. Nothing is written to the store: the pass
+	// travels in the visitor's own cookie, which the Function already opens.
+	it('passes the visitor for ten minutes when Policy cannot answer', async () => {
+		vi.stubGlobal('fetch', vi.fn(async () => new Response('down', { status: 503 })));
 		const kvs = liveKvs();
 		const update = vi.spyOn(kvs, 'update');
-		const verify = () =>
-			handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), { config: BAKED, kvs });
-		// Open the breaker from the outside; the next failure would write anyway.
-		for (let i = 0; i < 19; i++) await persistingBreaker(kvs).recordFailure();
-		await verify();
-		expect(kvs.store.brk).toBeDefined();
-		expect(Number(kvs.store.brk)).toBeGreaterThan(Math.floor(Date.now() / 1000));
-		expect(Number(kvs.store.brk)).toBeLessThanOrEqual(
-			Math.floor((Date.now() + OPEN_GRACE_MS) / 1000)
-		);
-		const writes = update.mock.calls.length;
-		await verify();
-		await verify();
-		expect(update.mock.calls.length).toBe(writes);
+		const result = await handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), {
+			config: BAKED,
+			kvs,
+		});
+		expect(result.status).toBe('200');
+		expect(setCookies(result)[0]).toContain(`Max-Age=${UNVERIFIED_PASS_SECONDS}`);
+		expect(update).not.toHaveBeenCalled();
 	});
 
-	// A failed half-open probe re-opens the breaker with a later deadline. Written only
-	// when it flipped, the store kept the first one, and the Function went back to
-	// refusing visitors about ninety seconds into an outage.
-	it('persists the new deadline when a failed probe re-opens the breaker', async () => {
-		const kvs = liveKvs();
-		const breaker = persistingBreaker(kvs);
-		const opened = Date.now();
-		for (let i = 0; i < 20; i++) await breaker.recordFailure(opened);
-		expect(Number(kvs.store.brk)).toBe(Math.floor((opened + OPEN_GRACE_MS) / 1000));
-		const probe = opened + 20_000;
-		expect(await breaker.takeProbe(probe)).not.toBeNull();
-		await breaker.recordFailure(probe);
-		expect(Number(kvs.store.brk)).toBe(Math.floor((probe + OPEN_GRACE_MS) / 1000));
+	it('stops asking a Policy that keeps failing, and still passes visitors', async () => {
+		const policy = vi.fn(async () => new Response('down', { status: 503 }));
+		vi.stubGlobal('fetch', policy);
+		const deps = { config: BAKED, kvs: liveKvs() };
+		const verify = () => handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), deps);
+		for (let i = 0; i < FAILURE_THRESHOLD; i++) await verify();
+		const asked = policy.mock.calls.length;
+		expect((await verify()).status).toBe('200');
+		expect(policy.mock.calls.length).toBe(asked);
 	});
 
 	// Verify mints against the clearance version. A container still holding the one

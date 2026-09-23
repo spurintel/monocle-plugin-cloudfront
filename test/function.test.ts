@@ -326,13 +326,14 @@ describe('CloudFront Function (viewer-request)', () => {
 		expect(result.body).toBeUndefined();
 	});
 
-	it('passes enforced traffic when the breaker is open', async () => {
-		const event = viewerEvent({ uri: '/account' });
+	// Only verify passes anyone now, so a breaker key an older Lambda left in the store
+	// must not open enforcement to a request that never asked.
+	it('ignores a breaker key left in the store by an older Lambda', async () => {
 		const result = (await loadHandler(
 			baseKv({ 'p:/account': 'e', brk: String(Math.floor(Date.now() / 1000) + 60) })
-		)(event)) as { headers?: Record<string, { value: string }>; uri?: string };
-		expect(result).toBe(event.request);
-		expect(event.request.headers['x-monocle-degraded']?.value).toBe('1');
+		)(viewerEvent({ uri: '/account' }))) as FnResponse;
+		expect(result.statusCode).toBe(503);
+		expect(result.body).toContain('/__mcl/challenge?return=');
 	});
 
 	it('matches a wildcard-segment enforce pattern from w', async () => {
