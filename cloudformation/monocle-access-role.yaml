@@ -159,7 +159,7 @@ Resources:
               # the scheduler's. Named precisely, never monocle-*, because a
               # role we did not create could otherwise be passed to our own
               # function, which is that role's permissions in our hands.
-              - Sid: LambdaRoleRead
+              - Sid: LambdaRoleReadDelete
                 Effect: Allow
                 Action:
                   - "iam:GetRole"
