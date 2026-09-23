@@ -2,6 +2,8 @@
 
 export const KVS_VALUE_BYTES = 1024;
 export const KVS_CACHE_MS = 60_000;
+/** How long a container waits to ask a store it could not read again. */
+export const KVS_RETRY_MS = 10_000;
 /**
  * How long a verdict cookie minted on another clearance version stands: longer than a
  * container can go on holding the version from before a rotation. The Function writes it as

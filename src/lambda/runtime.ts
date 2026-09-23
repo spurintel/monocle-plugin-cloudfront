@@ -16,7 +16,7 @@ import {
 	type VerdictPayload,
 } from '@spur.us/monocle-edge-core';
 
-import { KVS_CACHE_MS, ROTATION_GRACE_SECONDS } from '../shared/constants';
+import { KVS_CACHE_MS, KVS_RETRY_MS, ROTATION_GRACE_SECONDS } from '../shared/constants';
 import type { BakedConfig } from './config';
 import { readChunks } from './kvs';
 import type { Kvs } from './types';
@@ -53,7 +53,9 @@ let cached: { until: number; identity: string; runtime: Runtime } | undefined;
  * A store that cannot be read is ours to absorb: the runtime this container last built stands,
  * whatever its age, with the clearance version if that much was read, since verify mints
  * against it and the Function validates against it. A container with none gets defaults,
- * marked `unread` unless the clearance version was read.
+ * marked `unread` unless the clearance version was read. The store is asked again only after
+ * `KVS_RETRY_MS`, not on every request: each attempt may be billed, and a throttled store is
+ * only throttled harder.
  */
 export async function getRuntime(
 	baked: BakedConfig,
@@ -71,12 +73,16 @@ export async function getRuntime(
 		hostsRaw = (await readChunks(kvs, 'hosts')) ?? '[]';
 	} catch (error) {
 		console.warn(`monocle store unreadable: ${error instanceof Error ? error.name : 'unknown'}`);
-		if (held && (cv === undefined || cv === held.runtime.clearanceVersion)) return held.runtime;
 		const live = held?.runtime.live;
-		return build(baked, cv ?? '', live?.cfgRaw ?? '{}', JSON.stringify(live?.hosts ?? []), {
-			unread: cv === undefined,
-			defaults: !live,
-		});
+		const runtime =
+			held && (cv === undefined || cv === held.runtime.clearanceVersion)
+				? held.runtime
+				: await build(baked, cv ?? '', live?.cfgRaw ?? '{}', JSON.stringify(live?.hosts ?? []), {
+						unread: cv === undefined,
+						defaults: !live || live.defaults === true,
+					});
+		cached = { until: now + KVS_RETRY_MS, identity, runtime };
+		return runtime;
 	}
 	const runtime = await build(baked, cv, cfgRaw, hostsRaw, {});
 	cached = { until: now + KVS_CACHE_MS, identity, runtime };

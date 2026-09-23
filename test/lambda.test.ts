@@ -18,6 +18,7 @@ import { CRAWLER_FEEDS, refreshCrawlerRanges } from '../src/lambda/crawler';
 import { handleOriginRequest, handler } from '../src/lambda/index';
 import { MemoryKvs, readChunks, writeChunks } from '../src/lambda/kvs';
 import { getRuntime, honoursClearance, resetRuntimeCache } from '../src/lambda/runtime';
+import { KVS_RETRY_MS } from '../src/shared/constants';
 import { createHmacSealer } from '@spur.us/monocle-edge-core';
 
 const SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
@@ -472,6 +473,33 @@ describe('fixes from the audit', () => {
 		expect(await getRuntime(BAKED, kvs, { now: 1_000 + 3_600_000 })).toBe(first);
 	});
 
+	// Each attempt may be billed, and a throttled store is only throttled harder.
+	it('asks a store it could not read again only after a pause', async () => {
+		const kvs = liveKvs();
+		const get = vi.spyOn(kvs, 'get').mockRejectedValue(new Error('ThrottlingException'));
+		const cold = await getRuntime(BAKED, kvs, { now: 1_000 });
+		expect(await getRuntime(BAKED, kvs, { now: 1_000 + KVS_RETRY_MS - 1 })).toBe(cold);
+		expect(get).toHaveBeenCalledTimes(1);
+		await getRuntime(BAKED, kvs, { now: 1_000 + KVS_RETRY_MS });
+		expect(get).toHaveBeenCalledTimes(2);
+	});
+
+	// Pages built from defaults are cached for no time, so the mark must outlast a partial read.
+	it('keeps a runtime built from defaults marked when a later read gets only the version', async () => {
+		const kvs = liveKvs();
+		const read = kvs.get.bind(kvs);
+		const get = vi.spyOn(kvs, 'get').mockRejectedValue(new Error('ThrottlingException'));
+		await getRuntime(BAKED, kvs, { now: 1_000 });
+		get.mockImplementation(async (key: string) => {
+			if (key === 'cv') return read(key);
+			throw new Error('ThrottlingException');
+		});
+		const runtime = await getRuntime(BAKED, kvs, { now: 1_000 + KVS_RETRY_MS });
+		expect(runtime.clearanceVersion).toBe(kvs.store.cv);
+		expect(runtime.live.unread).toBeUndefined();
+		expect(runtime.live.defaults).toBe(true);
+	});
+
 	// The version was read and then the rest failed. The one held is from before a rotation, so
 	// keeping it mints cookies the Function, which reads the new one, refuses.
 	it('keeps a clearance version it read when the rest of the store fails', async () => {
@@ -597,6 +625,36 @@ describe('fixes from the audit', () => {
 			deps
 		);
 		expect(JSON.parse(state.body ?? '{}').hint.verdict).toBe('allow');
+	});
+
+	// The Function reads a rotation before a warm container does, and refuses an allow on the
+	// old version minted more than two minutes ago. Handing that cookie back would send the
+	// visitor from the challenge to the page and back until the container read the store.
+	it('mints again for an allow the Function would refuse after a rotation', async () => {
+		const policy = vi.fn(async () => policyResponse(true));
+		vi.stubGlobal('fetch', policy);
+		const kvs = liveKvs();
+		const deps = { config: BAKED, kvs };
+		await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), deps);
+		kvs.store.cv = 'cd'.repeat(32);
+		const held = await mintVerdictCookie({
+			sealer: createHmacSealer(SECRET),
+			audience: ID,
+			scope: COOKIE_SCOPE,
+			ipBinding: IP,
+			verdict: 'allow',
+			sid: 'sid-1',
+			jti: 'jti-1',
+			nowSeconds: Math.floor(Date.now() / 1000) - 1800,
+			clearanceVersion: CV,
+		});
+		const result = await handleOriginRequest(
+			originEvent({ body: { captchaData: 'bundle' }, headers: { Cookie: held.setCookie.split(';')[0]! } }),
+			deps
+		);
+		expect(result.status).toBe('200');
+		expect(policy).toHaveBeenCalledOnce();
+		expect(cookieValue(setCookies(result)[0]!, COOKIE_SCOPE.names.verdict)).toBeTruthy();
 	});
 
 	// A verify already warm in this container keeps the version it holds when the store
