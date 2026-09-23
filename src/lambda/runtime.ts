@@ -4,6 +4,7 @@ import {
 	BLOCK_STATUSES,
 	COOKIE_SCOPE,
 	coreScriptUrl,
+	createHmacSealer,
 	DEFAULT_CORE_HOST,
 	scriptSegment,
 	type BlockPageConfig,
@@ -12,7 +13,6 @@ import {
 } from '@spur.us/monocle-edge-core';
 
 import { KVS_CACHE_MS } from '../shared/constants';
-import { createHmacSealer } from '../shared/hmac-sealer';
 import type { BakedConfig } from './config';
 import { readChunks } from './kvs';
 import type { Kvs } from './types';
@@ -46,7 +46,10 @@ export async function getRuntime(
 	const identity = `${baked.cookieSecret}|${baked.deploymentId}|${baked.publishableKey}|${baked.secretKey}`;
 	if (cached && cached.identity === identity && now < cached.until) {
 		if (!freshClearance) return cached.runtime;
-		if (((await kvs.get('cv')) ?? '') === cached.runtime.clearanceVersion) return cached.runtime;
+		// A store that cannot answer now leaves the version this container holds standing,
+		// rather than failing verify for the visitor.
+		const held = cached.runtime.clearanceVersion;
+		if (((await kvs.get('cv').catch(() => held)) ?? '') === held) return cached.runtime;
 	}
 
 	const cv = (await kvs.get('cv')) ?? '';
@@ -85,7 +88,7 @@ export async function getRuntime(
 		audience: baked.deploymentId,
 		clearanceVersion: cv,
 		scope: COOKIE_SCOPE,
-		secretKey: baked.secretKey,
+		secretKey: async () => baked.secretKey,
 		sessionTracking: live.sessionTracking,
 		blockPage: live.blockPage,
 		// The Function cannot inject, so the resident script never carries a redirect target.

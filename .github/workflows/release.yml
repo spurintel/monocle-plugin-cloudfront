@@ -46,7 +46,7 @@ jobs:
         run: npm test
 
       - name: Build Function + Lambda
-        # dist/function/index.js (deployed as-written, comment-stripped) and
+        # dist/function/index.js (minified by strip.mjs) and
         # dist/lambda/index.js (esbuild bundle).
         run: npm run build
 

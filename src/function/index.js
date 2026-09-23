@@ -8,8 +8,10 @@ async function handler(event) {
 		var uri = typeof req.uri === 'string' ? req.uri : '/';
 		// Before any return: a viewer must not be able to hand the origin a
 		// contract header or one of our cookies just because a later check fails
-		// open. The verdict is read out first, since strip removes it.
-		var held = req.cookies && req.cookies['__Host-mcl_c'];
+		// open. The verdict and the assess marker are read out first, since strip
+		// removes them.
+		var held = one(req.cookies && req.cookies['__Host-mcl_c']);
+		var skipped = one(req.cookies && req.cookies['__Host-mcl_skip']);
 		strip(req);
 		var kvs = cf.kvs();
 		var ver = await g(kvs, 'v');
@@ -29,20 +31,22 @@ async function handler(event) {
 		}
 		// Each reading an origin might serve is resolved and the strictest stands:
 		// enforced if any is, an infrastructure pass only if all are.
-		var hit = null,
+		// The runtime rejects `await` in an argument position, so it stands alone.
+		var wRaw = await readChunks(kvs, 'w');
+		var w = wild(wRaw),
+			hit = null,
 			inf = true;
 		for (var i = 0; i < paths.length; i++) {
 			if (paths[i] === '/__mcl' || paths[i].indexOf('/__mcl/') === 0) return resp(404, H(), null);
-			var h = await resolve(kvs, paths[i]);
+			var h = await resolve(kvs, paths[i], w);
 			if (h === 'e' || !hit) hit = h;
 			if (!infra(paths[i])) inf = false;
 		}
-		var ck = held && held.multiValue && held.multiValue.length > 1 ? null : held;
-		var cookieVal = ck ? ck.value : '';
 		if (!hit) return req;
 		var method = (req.method || 'GET').toUpperCase();
 		var hd = req.headers;
-		var ws = hd.upgrade && hd.upgrade.value.toLowerCase().indexOf('websocket') !== -1;
+		// CloudFront hides Upgrade from functions; every WebSocket handshake carries this.
+		var ws = !!hd['sec-websocket-key'];
 		var sec = hd['sec-fetch-mode'] ? hd['sec-fetch-mode'].value : '';
 		var acc = hd.accept ? hd.accept.value : '';
 		var nav = !ws && (sec.toLowerCase() === 'navigate' || acc.indexOf('application/xhtml+xml') !== -1);
@@ -56,7 +60,7 @@ async function handler(event) {
 		// Pass, marked, so the origin and a curl can see the store is
 		// inconsistent; the fix is the missing keys, never a challenge loop.
 		if (!id || !cv) return skip(req, 'config');
-		var verdict = cookieVal ? openVerdict(cookieVal, key, id, cv, bind) : null;
+		var verdict = held ? openVerdict(held, key, id, cv, bind) : null;
 		if (safe && !ws) {
 			var botsRaw = await readChunks(kvs, 'bots');
 			if (botsRaw && inPacked(ip, botsRaw)) return req;
@@ -68,13 +72,18 @@ async function handler(event) {
 		if (hit === 'e') {
 			var ipsRaw = await readChunks(kvs, 'ips');
 			if (ipsRaw && inPacked(ip, ipsRaw)) return req;
-			if (verdict === 'block') return await blockResp(kvs, req, nav, method);
+			if (verdict === 'block') return await blockResp(kvs, req, nav, method, w);
 			if (verdict === 'allow') return req;
-			// Refused only for want of a verdict, which verify always gives: when
-			// Policy cannot answer, the Lambda passes the visitor there.
+			// Refused only for want of a verdict. Verify gives every visitor one
+			// unless Policy refused their own bundle: when Policy cannot answer, the
+			// Lambda passes them.
 			return refuse(req, method, nav, ws, safe, uri);
 		}
-		if (!verdict && nav && safe) return bounce(503, challenge(uri, qstr(req.querystring)), method, 1);
+		// An assessed path only ever wanted to observe, so it serves a visitor the
+		// challenge cannot help: an unbindable address, or the challenge page's
+		// marker that our script failed them. The marker is theirs to forge, and
+		// is read nowhere else.
+		if (!verdict && nav && safe && bind && !skipped) return bounce(503, challenge(uri, qstr(req.querystring)), method, 1);
 		return req;
 	} catch (e) {
 		return skip(req, 'error');
@@ -110,18 +119,26 @@ async function readChunks(kvs, key) {
 	return raw;
 }
 
+// Our headers and cookies, and the path overrides some stacks serve instead of
+// the path we assessed. No browser sends one.
 function strip(req) {
 	for (var n in req.headers) {
-		if (n.indexOf('x-monocle-') === 0 || n.indexOf('x-mcl-') === 0) delete req.headers[n];
+		if (/^x-(monocle|mcl)-|^x-(original|rewrite)-url$/.test(n)) delete req.headers[n];
 	}
 	if (!req.cookies) return;
-	for (var c in req.cookies) if (c.indexOf('__Host-mcl_') === 0) delete req.cookies[c];
+	for (var c in req.cookies) if (/^__(Host|Secure)-mcl_/.test(c)) delete req.cookies[c];
+}
+
+// A cookie's value, or '' when it is absent or sent more than once.
+function one(c) {
+	return c && !(c.multiValue && c.multiValue.length > 1) ? c.value : '';
 }
 
 // Every path an origin might take the request path to mean: decoded up to twice,
-// with `;params` kept or dropped, slashes merged or not, dot segments resolved or
-// not, cut at a decoded `?` or `#` or not. Mirrors edge-core's pathReadings; the
-// shared corpus pins them together. Throws for what no ordinary client sends.
+// with `;params` kept or dropped, backslashes turned to slashes or not, slashes
+// merged or not, dot segments resolved or not, cut at a decoded `?` or `#` or
+// not. Mirrors edge-core's pathReadings; the shared corpus pins them together.
+// Throws for what no ordinary client sends.
 function readings(raw) {
 	if (typeof raw !== 'string' || Buffer.byteLength(raw, 'utf8') > 8192 || raw.charAt(0) !== '/' || /[\\\x00-\x1f\x7f?#]/.test(raw))
 		throw 1;
@@ -160,8 +177,11 @@ function readings(raw) {
 				})
 				.join('/');
 		});
-		list = vary(list, /\/\/|\\/, function (p) {
-			return p.replace(/[\\/]+/g, '/');
+		list = vary(list, /\\/, function (p) {
+			return p.replace(/\\/g, '/');
+		});
+		list = vary(list, /\/\//, function (p) {
+			return p.replace(/\/{2,}/g, '/');
 		});
 		list = vary(list, /\/\.\.?(?:\/|$)/, dots);
 		for (j = 0; j < list.length; j++) {
@@ -196,7 +216,17 @@ function dots(p) {
 	return '/' + kept.join('/');
 }
 
-async function resolve(kvs, path) {
+// The wildcard patterns, read once per request. Unreadable is none.
+function wild(raw) {
+	try {
+		var l = JSON.parse(raw);
+		return Array.isArray(l) ? l : [];
+	} catch (e) {
+		return [];
+	}
+}
+
+async function resolve(kvs, path, w) {
 	var e = false,
 		a = false,
 		pHit = await g(kvs, 'p:' + path);
@@ -211,17 +241,11 @@ async function resolve(kvs, path) {
 		var i = cur.lastIndexOf('/');
 		cur = i <= 0 ? '/' : cur.slice(0, i);
 	}
-	var wRaw = await readChunks(kvs, 'w');
-	if (wRaw) {
-		try {
-			var list = JSON.parse(wRaw);
-			for (var j = 0; j < list.length && j < 100; j++) {
-				var w = list[j];
-				if (!w || typeof w.p !== 'string' || !matchWild(path, w.p)) continue;
-				if (w.e) e = true;
-				else a = true;
-			}
-		} catch (err) {}
+	for (var j = 0; j < w.length && j < 100; j++) {
+		var x = w[j];
+		if (!x || typeof x.p !== 'string' || !matchWild(path, x.p)) continue;
+		if (x.e) e = true;
+		else a = true;
 	}
 	return e ? 'e' : a ? 'a' : null;
 }
@@ -326,7 +350,15 @@ function v4(s) {
 	return o;
 }
 
+// All eight groups as 32 hex digits, an embedded IPv4 tail as its two groups.
 function v6hex(addr) {
+	var m = /^(.*:)(\d+\.\d+\.\d+\.\d+)$/.exec(addr),
+		t;
+	if (m) {
+		t = v4(m[2]);
+		if (!t) return null;
+		addr = m[1] + (t[0] * 256 + t[1]).toString(16) + ':' + (t[2] * 256 + t[3]).toString(16);
+	}
 	var dc = addr.indexOf('::');
 	if (dc !== addr.lastIndexOf('::')) return null;
 	var head = (dc === -1 ? addr : addr.slice(0, dc)).split(':');
@@ -342,24 +374,32 @@ function v6hex(addr) {
 	for (z = 0; z < 8 - n; z++) g.push('0');
 	for (i = 0; i < tail.length; i++) g.push(tail[i]);
 	var hex = '';
-	for (i = 0; i < 4; i++) {
+	for (i = 0; i < 8; i++) {
 		if (!/^[0-9a-fA-F]{1,4}$/.test(g[i])) return null;
 		hex += ('000' + parseInt(g[i], 16).toString(16)).slice(-4);
 	}
 	return hex;
 }
 
+// An address as edge-core reads it: IPv4 octets, or IPv6 as 32 hex digits, with
+// an IPv4-mapped IPv6 address read as the IPv4 one. Null when malformed.
+function addr(ip) {
+	if (!ip || ip.length > 45 || ip.indexOf('%') !== -1) return null;
+	if (ip.indexOf(':') === -1) return v4(ip);
+	var h = v6hex(ip);
+	if (!h || h.indexOf('00000000000000000000ffff') !== 0) return h;
+	return [0, 2, 4, 6].map(function (i) {
+		return parseInt(h.substr(24 + i, 2), 16);
+	});
+}
+
 function binding(ip) {
-	if (!ip) return null;
-	if (ip.indexOf(':') === -1) {
-		var a = v4(ip);
-		return a ? a.join('.') : null;
-	}
-	var hex = v6hex(ip);
-	if (!hex) return null;
-	var g = [],
+	var a = addr(ip),
+		g = [],
 		i;
-	for (i = 0; i < 4; i++) g.push(parseInt(hex.slice(i * 4, i * 4 + 4), 16).toString(16));
+	if (!a) return null;
+	if (typeof a !== 'string') return a.join('.');
+	for (i = 0; i < 4; i++) g.push(parseInt(a.slice(i * 4, i * 4 + 4), 16).toString(16));
 	return g.join(':') + '::/64';
 }
 
@@ -372,12 +412,10 @@ function inPacked(ip, raw) {
 	}
 	if (!set || !set.v4 || !set.v6) return false;
 	if (typeof set.expiresAt === 'number' && Math.floor(Date.now() / 1000) >= set.expiresAt) return false;
-	if (ip.indexOf(':') === -1) {
-		var a = v4(ip);
-		return a ? has(set.v4, ((a[0] << 24) | (a[1] << 16) | (a[2] << 8) | a[3]) >>> 0) : false;
-	}
-	var hex = v6hex(ip);
-	return hex ? has(set.v6, hex) : false;
+	var a = addr(ip);
+	if (!a) return false;
+	// IPv6 ranges are packed /64-granular, as the upper 16 hex digits.
+	return typeof a === 'string' ? has(set.v6, a.slice(0, 16)) : has(set.v4, ((a[0] << 24) | (a[1] << 16) | (a[2] << 8) | a[3]) >>> 0);
 }
 
 function has(r, n) {
@@ -414,18 +452,18 @@ function resp(code, headers, body) {
 	return o;
 }
 
+// CloudFront hands keys and values over as the visitor sent them, still
+// percent-encoded, so they go back as they are; challenge() encodes the whole
+// return path once. A repeated parameter arrives as multiValue, and every
+// occurrence goes back.
 function qstr(qs) {
-	if (!qs) return '';
 	var p = [],
 		k,
 		i,
 		mv;
 	for (k in qs) {
-		// A repeated parameter arrives as multiValue; reading .value alone dropped
-		// every occurrence after the first from the page the visitor returns to.
-		mv = qs[k].multiValue;
-		if (mv && mv.length) for (i = 0; i < mv.length; i++) p.push(encodeURIComponent(k) + '=' + encodeURIComponent(mv[i].value));
-		else p.push(encodeURIComponent(k) + '=' + encodeURIComponent(qs[k].value));
+		mv = qs[k].multiValue || [qs[k]];
+		for (i = 0; i < mv.length; i++) p.push(k + '=' + mv[i].value);
 	}
 	return p.length ? '?' + p.join('&') : '';
 }
@@ -475,7 +513,7 @@ function refuse(req, method, nav, ws, safe, uri) {
  * `https://evil.example/`). A target inside an enforced subtree is refused as
  * well, because blocking it would redirect to itself for ever.
  */
-async function redirectable(kvs, to) {
+async function redirectable(kvs, to, w) {
 	if (typeof to !== 'string' || to.charAt(0) !== '/' || to.indexOf('//') === 0) return false;
 	if (/[\\\x00-\x20]/.test(to) || to === '/__mcl' || to.indexOf('/__mcl/') === 0) return false;
 	var targets;
@@ -485,13 +523,13 @@ async function redirectable(kvs, to) {
 		return false;
 	}
 	for (var i = 0; i < targets.length; i++) {
-		var hit = await resolve(kvs, targets[i]);
+		var hit = await resolve(kvs, targets[i], w);
 		if (hit === 'e') return false;
 	}
 	return true;
 }
 
-async function blockResp(kvs, req, nav, method) {
+async function blockResp(kvs, req, nav, method, w) {
 	var cfgRaw = await readChunks(kvs, 'cfg');
 	var cfg;
 	try {
@@ -509,7 +547,7 @@ async function blockResp(kvs, req, nav, method) {
 		);
 	// Kept out of the `if` head: this runtime rejects `await` in an argument
 	// position, and the minifier will move it there.
-	var mayRedirect = await redirectable(kvs, bp.redirect);
+	var mayRedirect = await redirectable(kvs, bp.redirect, w);
 	if (mayRedirect) {
 		var st = method === 'GET' || method === 'HEAD' ? 307 : 303;
 		return resp(st, H(null, { location: { value: bp.redirect } }), null);

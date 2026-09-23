@@ -26,9 +26,16 @@ an HMAC-sealed `__Host-mcl_c` cookie (allow one hour, block ten minutes), the pa
 the return path, and the Function passes the request through to **cache and origin
 untouched**. Enforced paths refuse a cookieless request by shape (challenge shell, resubmit
 shell, challenge JSON, or an empty 403 for WebSockets) and answer a block verdict with the
-customer's block page, redirect or JSON. When Policy cannot answer a verify (down, erroring,
-refusing our key or too slow), the Lambda passes the visitor for ten minutes instead: our
-failure never answers them, and nothing about it is written to the store.
+customer's block page, redirect or JSON. Only Policy's verdict, or its refusal of the
+visitor's own bundle, answers a verify. When Policy cannot answer (down, slow, erroring, out
+of capacity, refusing our key or holding no policy for the deployment), the Lambda passes the
+visitor for ten minutes instead: our failure never answers them, and nothing about it is
+written to the store. When the challenge page cannot assess a visitor at all (our script did
+not load, or verify could not be reached), it sets a ten-minute `__Host-mcl_skip` cookie and
+returns once; an assessed path then serves them, and an enforced path ignores it.
+
+CloudFront hides the `Upgrade` header from edge functions, so the Function recognises a
+WebSocket handshake by its `Sec-WebSocket-Key`.
 
 The Function protects every hostname the distribution serves. CloudFront routes on the Host,
 so an alias the deployment does not list, or the `*.cloudfront.net` name, reaches the same
@@ -42,8 +49,9 @@ viewer-request Function can `return request`.
 ## Platform constraints this design encodes
 
 - **CloudFront Functions** ([runtime 2.0](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/functions-javascript-runtime-20.html)):
-  10 KB source limit (`build.mjs` and `test/function.test.ts` enforce it on the stripped
-  artifact), no network, no request body, crypto is `createHmac`/`createHash` only. So the
+  10 KB source limit (`build.mjs` and `test/function.test.ts` enforce it on the minified
+  artifact), no `await` inside call arguments (the build parses for it), no network, no
+  request body, crypto is `createHmac`/`createHash` only. So the
   cookie seal is HMAC-SHA256 over the edge core's v2 envelope, not AES-GCM, and the
   challenge page is not inlined: the Function serves a 300-byte shell that navigates to
   tier two. No injection is possible, so `injection` is always `off` on CloudFront.
@@ -123,7 +131,7 @@ npm test        # vitest: the 10 KB size gate, the strict-v3 path corpus run thr
                 # Function, the cross-pin that the Function opens what the Lambda mints,
                 # and the endpoint contract
 npm run build   # dist/function/index.js (stripped, size-checked, contract banner)
-                # dist/lambda/index.js  (esbuild CJS bundle for node20, contract banner)
+                # dist/lambda/index.js  (esbuild CJS bundle for node24, contract banner)
 ```
 
 Both artifacts begin with `// Monocle edge contract: 2`; the dashboard refuses artifacts

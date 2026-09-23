@@ -17,7 +17,7 @@ import { CRAWLER_FEEDS, refreshCrawlerRanges } from '../src/lambda/crawler';
 import { handleOriginRequest, handler } from '../src/lambda/index';
 import { MemoryKvs, readChunks, writeChunks } from '../src/lambda/kvs';
 import { resetRuntimeCache } from '../src/lambda/runtime';
-import { createHmacSealer } from '../src/shared/hmac-sealer';
+import { createHmacSealer } from '@spur.us/monocle-edge-core';
 
 const SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 const CV = 'ab'.repeat(32);
@@ -441,6 +441,58 @@ describe('fixes from the audit', () => {
 			clearanceVersion: rotated,
 		});
 		expect(state.status).toBe('allow');
+	});
+
+	// A verify already warm in this container keeps the version it holds when the store
+	// cannot answer the re-read, rather than failing the visitor.
+	it('verifies against the cached clearance version when the store cannot be read', async () => {
+		vi.stubGlobal('fetch', vi.fn(async () => policyResponse(true)));
+		const kvs = liveKvs();
+		const deps = { config: BAKED, kvs };
+		await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), deps);
+		vi.spyOn(kvs, 'get').mockRejectedValue(new Error('ThrottlingException'));
+		const result = await handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), deps);
+		expect(result.status).toBe('200');
+		const state = await validateVerdictCookie({
+			sealer: createHmacSealer(SECRET),
+			audience: ID,
+			cookieValue: cookieValue(setCookies(result)[0]!, COOKIE_SCOPE.names.verdict),
+			ipBinding: IP,
+			nowSeconds: Math.floor(Date.now() / 1000),
+			clearanceVersion: CV,
+		});
+		expect(state.status).toBe('allow');
+	});
+
+	// A Fetch header refuses text above U+00FF, and a site that keeps UTF-8 in its own
+	// cookies must not cost its visitors verify.
+	it('verifies a visitor whose site cookies hold UTF-8', async () => {
+		vi.stubGlobal('fetch', vi.fn(async () => policyResponse(true)));
+		const result = await handleOriginRequest(
+			originEvent({ body: { captchaData: 'bundle' }, headers: { Cookie: 'name=中文; theme=dark' } }),
+			{ config: BAKED, kvs: liveKvs() }
+		);
+		expect(result.status).toBe('200');
+		expect(setCookies(result)[0]).toContain(`${COOKIE_SCOPE.names.verdict}=`);
+	});
+
+	it('reads our own cookies from among the site cookies', async () => {
+		const kvs = liveKvs({ cfg: JSON.stringify({ session_tracking: 'session' }) });
+		const first = await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), {
+			config: BAKED,
+			kvs,
+		});
+		const sid = JSON.parse(first.body ?? '{}').sid as string;
+		const session = setCookies(first).find((h) => h.startsWith(`${COOKIE_SCOPE.names.session}=`))!.split(';')[0]!;
+		const again = await handleOriginRequest(
+			originEvent({
+				uri: '/__mcl/state',
+				method: 'GET',
+				headers: { Cookie: `name=中文; ${session}; theme=dark` },
+			}),
+			{ config: BAKED, kvs }
+		);
+		expect(JSON.parse(again.body ?? '{}').sid).toBe(sid);
 	});
 
 	it('writeChunks removes every stale continuation key', async () => {

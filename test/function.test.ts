@@ -10,9 +10,9 @@ import {
 } from '@spur.us/monocle-edge-core';
 import { describe, expect, it } from 'vitest';
 
-import { createHmacSealer } from '../src/shared/hmac-sealer';
+import { createHmacSealer } from '@spur.us/monocle-edge-core';
 // @ts-expect-error strip.mjs is untyped
-import { EDGE_CONTRACT_BANNER, stripForDeploy } from '../strip.mjs';
+import { awaitInArguments, EDGE_CONTRACT_BANNER, stripForDeploy } from '../strip.mjs';
 
 const SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 const PREV = 'ff'.repeat(32);
@@ -77,7 +77,8 @@ function viewerEvent(overrides: {
 	method?: string;
 	secFetchMode?: string;
 	accept?: string;
-	upgrade?: string;
+	websocket?: boolean;
+	querystring?: Record<string, { value: string; multiValue?: { value: string }[] }>;
 	cookies?: Record<string, { value: string; multiValue?: { value: string }[] }>;
 } = {}) {
 	const headers: Record<string, { value: string }> = {
@@ -86,12 +87,13 @@ function viewerEvent(overrides: {
 	if (overrides.secFetchMode !== undefined) headers['sec-fetch-mode'] = { value: overrides.secFetchMode };
 	else headers['sec-fetch-mode'] = { value: 'navigate' };
 	if (overrides.accept) headers.accept = { value: overrides.accept };
-	if (overrides.upgrade) headers.upgrade = { value: overrides.upgrade };
+	// CloudFront never shows a function `Upgrade`; the handshake's own key is what arrives.
+	if (overrides.websocket) headers['sec-websocket-key'] = { value: 'dGhlIHNhbXBsZSBub25jZQ==' };
 	return {
 		request: {
 			method: overrides.method ?? 'GET',
 			uri: overrides.uri ?? '/page',
-			querystring: {},
+			querystring: overrides.querystring ?? {},
 			headers,
 			cookies: overrides.cookies
 				? overrides.cookies
@@ -129,6 +131,16 @@ type FnResponse = {
 };
 
 describe('CloudFront Function (viewer-request)', () => {
+	// Node runs `f(await g())` fine and the Functions runtime refuses to compile it, so the
+	// build parses for it rather than trusting a test run.
+	it('refuses an await anywhere inside call arguments, and nothing else', () => {
+		for (const code of ['f(await g())', 'f(a, await g())', 'f(a + await g())', 'new F({ x: await g() })'])
+			expect(awaitInArguments(`async function h() { ${code} }`), code).toBe(true);
+		for (const code of ['var x = await g(); f(x)', 'f(async function () { await g(); })', 'f(async () => await g())'])
+			expect(awaitInArguments(`async function h() { ${code} }`), code).toBe(false);
+		expect(() => stripForDeploy('async function handler(e) { return f(await g(e)); }')).toThrow(/await/);
+	});
+
 	it('stays under the 10 KB runtime limit once stripped for deploy', () => {
 		const deployed = stripForDeploy(source);
 		const size = Buffer.byteLength(deployed, 'utf8');
@@ -321,7 +333,7 @@ describe('CloudFront Function (viewer-request)', () => {
 		const packed = packCidrSet([IP]);
 		const result = (await loadHandler(
 			baseKv({ 'p:/page': 'e', bots: JSON.stringify({ ...packed, expiresAt: Math.floor(Date.now() / 1000) + 3600 }) })
-		)(viewerEvent({ upgrade: 'websocket' }))) as FnResponse;
+		)(viewerEvent({ websocket: true }))) as FnResponse;
 		expect(result.statusCode).toBe(403);
 		expect(result.body).toBeUndefined();
 	});
@@ -358,6 +370,17 @@ describe('CloudFront Function (viewer-request)', () => {
 			})
 		)) as FnResponse;
 		expect(result.statusCode).toBe(503);
+	});
+
+	// Edge-core reads an IPv4-mapped address as the IPv4 one, and the Lambda mints for that.
+	it('binds an IPv4-mapped address as edge-core does', async () => {
+		for (const ip of ['::ffff:203.0.113.9', '::ffff:cb00:7109']) {
+			const cookie = await mintCookie(ip);
+			const event = viewerEvent({ uri: '/account', cookie, ip });
+			expect(await loadHandler(baseKv({ 'p:/account': 'e' }))(event), ip).toBe(event.request);
+			const plain = viewerEvent({ uri: '/account', cookie, ip: IP });
+			expect(await loadHandler(baseKv({ 'p:/account': 'e' }))(plain), ip).toBe(plain.request);
+		}
 	});
 
 	it('pins IPv6 /64 binding against edge-core', async () => {
@@ -504,6 +527,57 @@ describe('CloudFront Function (viewer-request)', () => {
 			expect(await handler(event), JSON.stringify(bad)).toBe(event.request);
 			expect(event.request.headers['x-monocle-skip']?.value).toBe('config');
 		}
+	});
+
+	// Some stacks serve the path these name instead of the one we assessed. No browser sends one.
+	it('never forwards a path override or a cookie of ours to the origin', async () => {
+		const event = viewerEvent({ uri: '/page', secFetchMode: 'cors' });
+		event.request.headers['x-original-url'] = { value: '/account' };
+		event.request.headers['x-rewrite-url'] = { value: '/account' };
+		event.request.cookies = {
+			'__Secure-mcl_x': { value: 'forged' },
+			'__Host-mcl_skip': { value: '1' },
+			theme: { value: 'dark' },
+		};
+		const result = (await loadHandler(baseKv())(event)) as {
+			headers: Record<string, unknown>;
+			cookies: Record<string, unknown>;
+		};
+		expect(result).toBe(event.request);
+		expect(result.headers['x-original-url']).toBeUndefined();
+		expect(result.headers['x-rewrite-url']).toBeUndefined();
+		expect(Object.keys(result.cookies)).toEqual(['theme']);
+	});
+
+	// The challenge page leaves this when our script could not load. Forged, it gains only
+	// what a request that is not a navigation already has.
+	it('serves an assessed navigation carrying the assess marker', async () => {
+		const event = viewerEvent({ cookies: { '__Host-mcl_skip': { value: '1' } } });
+		expect(await loadHandler(baseKv())(event)).toBe(event.request);
+	});
+
+	it('never lets the assess marker past an enforced path', async () => {
+		const event = viewerEvent({ uri: '/account', cookies: { '__Host-mcl_skip': { value: '1' } } });
+		const result = (await loadHandler(baseKv({ 'p:/account': 'e' }))(event)) as FnResponse;
+		expect(result.statusCode).toBe(503);
+		expect(result.body).toContain('/__mcl/challenge?return=');
+	});
+
+	// CloudFront hands query values over still percent-encoded; encoding them again sent the
+	// visitor back to a different URL, which breaks OAuth callbacks and search links.
+	it('returns the visitor to the query string they sent, encoded once', async () => {
+		const result = (await loadHandler(baseKv())(
+			viewerEvent({
+				uri: '/search',
+				querystring: {
+					q: { value: 'caf%C3%A9%20au%20lait' },
+					next: { value: '%2Faccount' },
+					tag: { value: 'a', multiValue: [{ value: 'a' }, { value: 'b%2Bc' }] },
+				},
+			})
+		)) as FnResponse;
+		const target = /return=([^"]+)"/.exec(result.body ?? '')![1]!;
+		expect(decodeURIComponent(target)).toBe('/search?q=caf%C3%A9%20au%20lait&next=%2Faccount&tag=a&tag=b%2Bc');
 	});
 
 	// A fail-open return must not hand the origin headers or cookies the viewer set.

@@ -1,5 +1,7 @@
 /** CloudFront event shapes to and from the Fetch API the shared endpoints speak. */
 
+import { jsonResponse as coreJsonResponse } from '@spur.us/monocle-edge-core';
+
 import type { EdgeHeaders, EdgeRequest, EdgeResponse } from './types';
 
 const STATUS_TEXT: Record<string, string> = {
@@ -15,16 +17,6 @@ const STATUS_TEXT: Record<string, string> = {
 	'422': 'Unprocessable Entity',
 	'429': 'Too Many Requests',
 	'503': 'Service Unavailable',
-};
-
-export const REFUSAL_HEADERS: Record<string, string> = {
-	'Cache-Control': 'no-store',
-	'X-Robots-Tag': 'noindex',
-	'Vary': 'Sec-Fetch-Mode, Accept',
-	'X-Frame-Options': 'DENY',
-	'Content-Security-Policy': "frame-ancestors 'none'; base-uri 'none'; object-src 'none'",
-	'Referrer-Policy': 'no-referrer',
-	'X-Content-Type-Options': 'nosniff',
 };
 
 export function toHeaders(
@@ -57,30 +49,40 @@ export function edgeResponse(
 	return response;
 }
 
-export function jsonResponse(
-	body: unknown,
-	status: number,
-	extra: Record<string, string> = {}
-): EdgeResponse {
-	return edgeResponse(
-		status,
-		toHeaders({ ...REFUSAL_HEADERS, 'Content-Type': 'application/json', ...extra }),
-		JSON.stringify(body)
-	);
+/** Edge-core's JSON answer, with the headers every Monocle response carries. */
+export function jsonResponse(body: unknown, status: number): Promise<EdgeResponse> {
+	return fromResponse(coreJsonResponse(body, status));
 }
 
 export function headerValue(headers: EdgeHeaders, name: string): string | undefined {
 	return headers[name.toLowerCase()]?.[0]?.value;
 }
 
-/** The viewer's request as a Fetch API Request. `host` is only for the URL; nothing routes on it. */
+/**
+ * The viewer's request as a Fetch API Request. `host` is only for the URL; nothing routes on
+ * it. CloudFront hands over header values as text, and a Fetch header refuses one above
+ * U+00FF, so a value it cannot hold is left out rather than failing the request: a site
+ * cookie in UTF-8 must never cost the visitor verify.
+ */
 export function toRequest(request: EdgeRequest, host: string): Request {
 	const headers = new Headers();
+	const keep = (name: string, value: string) => {
+		try {
+			headers.append(name, value);
+		} catch {
+			// No endpoint reads a value a Fetch header cannot hold.
+		}
+	};
 	for (const [name, values] of Object.entries(request.headers)) {
-		// CloudFront may split cookies into several entries; a Cookie header joins with `; `.
-		if (name === 'cookie') headers.set('Cookie', values.map((h) => h.value).join('; '));
-		else for (const header of values) headers.append(header.key ?? name, header.value);
+		if (name !== 'cookie') for (const header of values) keep(header.key ?? name, header.value);
 	}
+	// The endpoints read only our own cookies, whose values are plain ASCII. CloudFront may
+	// split the header into several entries, and one Cookie header joins them with `; `.
+	const ours = (request.headers.cookie ?? [])
+		.flatMap((h) => h.value.split(';'))
+		.map((part) => part.trim())
+		.filter((cookie) => /^__(Host|Secure)-mcl_[\x21-\x7e]*$/.test(cookie));
+	if (ours.length) keep('Cookie', ours.join('; '));
 	const method = (request.method || 'GET').toUpperCase();
 	const body =
 		request.body?.data !== undefined && method !== 'GET' && method !== 'HEAD'
