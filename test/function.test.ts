@@ -106,7 +106,12 @@ function viewerEvent(overrides: {
 	};
 }
 
-async function mintCookie(ip = IP, verdict: 'allow' | 'block' = 'allow', key = SECRET) {
+async function mintCookie(
+	ip = IP,
+	verdict: 'allow' | 'block' = 'allow',
+	key = SECRET,
+	{ clearanceVersion = CV, ttlSeconds }: { clearanceVersion?: string; ttlSeconds?: number } = {}
+) {
 	const binding = bindingForm(ip);
 	if (!binding) throw new Error('unbindable');
 	const minted = await mintVerdictCookie({
@@ -118,7 +123,8 @@ async function mintCookie(ip = IP, verdict: 'allow' | 'block' = 'allow', key = S
 		sid: 'sid-1',
 		jti: 'jti-1',
 		nowSeconds: Math.floor(Date.now() / 1000),
-		clearanceVersion: CV,
+		clearanceVersion,
+		ttlSeconds,
 	});
 	return minted.setCookie.split(';')[0]!.slice(`${COOKIE_SCOPE.names.verdict}=`.length);
 }
@@ -219,6 +225,24 @@ describe('CloudFront Function (viewer-request)', () => {
 		const event = viewerEvent({ uri: '/account', cookie });
 		const kv = baseKv({ 'p:/account': 'e' });
 		expect(await loadHandler(kv)(event)).toBe(event.request);
+	});
+
+	// A Lambda that cannot read the store gives the ten-minute pass core gives when Policy
+	// cannot answer, under an empty clearance version: accepted as that pass and nothing more.
+	it('accepts the pass a Lambda that cannot read the store gives, and only that pass', async () => {
+		const kv = baseKv({ 'p:/account': 'e' });
+		const pass = await mintCookie(IP, 'allow', SECRET, { clearanceVersion: '', ttlSeconds: 600 });
+		const event = viewerEvent({ uri: '/account', cookie: pass });
+		expect(await loadHandler(kv)(event)).toBe(event.request);
+
+		for (const cookie of [
+			await mintCookie(IP, 'allow', SECRET, { clearanceVersion: '' }),
+			await mintCookie(IP, 'block', SECRET, { clearanceVersion: '', ttlSeconds: 600 }),
+			await mintCookie(IP, 'allow', SECRET, { clearanceVersion: 'other', ttlSeconds: 600 }),
+		]) {
+			const refused = (await loadHandler(kv)(viewerEvent({ uri: '/account', cookie }))) as FnResponse;
+			expect(refused.statusCode).toBe(503);
+		}
 	});
 
 	it('rejects a tampered cookie and challenges', async () => {

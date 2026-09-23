@@ -445,14 +445,31 @@ describe('fixes from the audit', () => {
 	});
 
 	// A store that cannot be read is ours. A container with a runtime keeps using it, however old;
-	// one without still serves every page that needs no store, and refuses only to mint or read a
-	// cookie without the clearance version, which would loop the visitor.
+	// one without serves every page, and verify gives the ten-minute pass it gives when Policy
+	// cannot answer, under the empty clearance version the Function accepts for that pass alone.
 	it('keeps the last runtime, whatever its age, when the store cannot be read', async () => {
 		const kvs = liveKvs();
 		const first = await getRuntime(BAKED, kvs, { now: 1_000 });
 		vi.spyOn(kvs, 'get').mockRejectedValue(new Error('ThrottlingException'));
 		expect(await getRuntime(BAKED, kvs, { now: 1_000 + 3_600_000 })).toBe(first);
 		expect(await getRuntime(BAKED, kvs, { now: 1_000 + 3_600_000, freshClearance: true })).toBe(first);
+	});
+
+	// The version was read and then the rest failed. The one held is from before a rotation, so
+	// keeping it mints cookies the Function, which reads the new one, refuses.
+	it('keeps a clearance version it read when the rest of the store fails', async () => {
+		const kvs = liveKvs();
+		await getRuntime(BAKED, kvs, { now: 1_000 });
+		const rotated = 'cd'.repeat(32);
+		kvs.store.cv = rotated;
+		const read = kvs.get.bind(kvs);
+		vi.spyOn(kvs, 'get').mockImplementation(async (key: string) => {
+			if (key === 'cv') return read(key);
+			throw new Error('ThrottlingException');
+		});
+		const runtime = await getRuntime(BAKED, kvs, { now: 1_000 + 3_600_000 });
+		expect(runtime.clearanceVersion).toBe(rotated);
+		expect(runtime.live.unread).toBeUndefined();
 	});
 
 	it('serves the pages that need no store on a cold container that cannot read it', async () => {
@@ -465,10 +482,35 @@ describe('fixes from the audit', () => {
 		expect(
 			(await handleOriginRequest(originEvent({ uri: `/__mcl/${segment}/mcl.js`, method: 'GET' }), deps)).status
 		).toBe('200');
-		expect((await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), deps)).status).toBe('503');
+		// Built from defaults, so kept out of the shared cache.
+		const page = await handleOriginRequest(originEvent({ uri: '/__mcl/challenge', method: 'GET' }), deps);
+		expect(page.headers?.['cache-control']?.[0]?.value).toMatch(/no-store/);
+		expect(page.headers?.['cache-control']?.[0]?.value).not.toMatch(/public/);
+		expect((await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), deps)).status).toBe('200');
+		const policy = vi.fn();
+		vi.stubGlobal('fetch', policy);
 		const verify = await handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), deps);
-		expect(verify.status).toBe('503');
-		expect(setCookies(verify)).toEqual([]);
+		expect(verify.status).toBe('200');
+		expect(policy).not.toHaveBeenCalled();
+		const value = cookieValue(setCookies(verify)[0]!, COOKIE_SCOPE.names.verdict);
+		const pass = await validateVerdictCookie({
+			sealer: createHmacSealer(SECRET),
+			audience: ID,
+			cookieValue: value,
+			ipBinding: IP,
+			nowSeconds: Math.floor(Date.now() / 1000),
+			clearanceVersion: '',
+		});
+		expect(pass.status).toBe('allow');
+	});
+
+	// CloudFront keeps one cache entry for GET and HEAD, so a HEAD must not fill the cached
+	// challenge page with an empty body.
+	it('answers a HEAD for a cached page as a GET', async () => {
+		const deps = { config: BAKED, kvs: liveKvs() };
+		const head = await handleOriginRequest(originEvent({ uri: '/__mcl/challenge', method: 'HEAD' }), deps);
+		expect(head.status).toBe('200');
+		expect(head.body).toBeTruthy();
 	});
 
 	// Another container's verify minted against the rotated version; the challenge page asks

@@ -10,6 +10,7 @@ const STATUS_TEXT: Record<string, string> = {
 	'303': 'See Other',
 	'307': 'Temporary Redirect',
 	'400': 'Bad Request',
+	'401': 'Unauthorized',
 	'403': 'Forbidden',
 	'404': 'Not Found',
 	'413': 'Payload Too Large',

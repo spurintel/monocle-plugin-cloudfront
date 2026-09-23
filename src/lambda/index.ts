@@ -14,7 +14,7 @@ import {
 } from '@spur.us/monocle-edge-core';
 
 import { SCRIPT_CACHE_SECONDS } from '../shared/constants';
-import { containerBreaker } from './breaker';
+import { containerBreaker, UNREAD_BREAKER } from './breaker';
 import { loadConfig, type BakedConfig } from './config';
 import { refreshCrawlerRanges } from './crawler';
 import { edgeResponse, fromResponse, headerValue, jsonResponse, toHeaders, toRequest } from './http';
@@ -94,21 +94,32 @@ export async function handleOriginRequest(
 
 	const readsClearance = canonicalPath === '/__mcl/verify' || canonicalPath === '/__mcl/state';
 	const runtime = await getRuntime(config, kvs, { freshClearance: readsClearance });
-	// With the clearance version unknown, a cookie minted or read now is one the Function
-	// would refuse, which loops the visitor. The pages that need no store still answer.
-	if (runtime.live.unread && readsClearance) return jsonResponse({ error: 'unavailable' }, 503);
+	// A store this container cannot read is ours to absorb. The clearance version is unknown,
+	// so verify gives the ten-minute pass it gives when Policy cannot answer, under the empty
+	// version the Function accepts for that pass alone; and what is built from defaults stays
+	// out of the shared cache.
+	const unread = runtime.live.unread === true;
 	const connectingIp = request.clientIp || null;
 	const distributionDomain = record.cf.config?.distributionDomainName?.toLowerCase();
 	// The deployment's hosts, plus the distribution's own domain. Never the origin-request Host,
 	// which names the customer's origin, not a viewer host. An alias the list leaves out passes
 	// on the browser's same-origin statement, which edge-core accepts alongside the list.
 	const allowedOrigins = [...runtime.live.hosts, ...(distributionDomain ? [distributionDomain] : [])];
-	const viewerRequest = toRequest(request, distributionDomain ?? headerValue(request.headers, 'host') ?? 'localhost');
+	// CloudFront keeps one cache entry for GET and HEAD, so a HEAD answered without a body on a
+	// cached page would leave it empty for every GET until it expired. There a HEAD is answered
+	// as a GET, and CloudFront sends the viewer the headers alone.
+	const cachedPage = canonicalPath === '/__mcl/challenge' || /^\/__mcl\/[^/]+\/mcl\.js$/.test(canonicalPath);
+	const viewerRequest = toRequest(
+		cachedPage && (request.method || '').toUpperCase() === 'HEAD' ? { ...request, method: 'GET' } : request,
+		distributionDomain ?? headerValue(request.headers, 'host') ?? 'localhost'
+	);
 	const response = await handleMclEndpoint(canonicalPath, {
 		runtime,
 		// The challenge page and the resident script sit in the CloudFront cache, so they are
 		// the shared kind: the session tag comes from /__mcl/state.
-		platform: { breaker: containerBreaker(), sharedPages: { maxAgeSeconds: SCRIPT_CACHE_SECONDS } },
+		platform: unread
+			? { breaker: UNREAD_BREAKER }
+			: { breaker: containerBreaker(), sharedPages: { maxAgeSeconds: SCRIPT_CACHE_SECONDS } },
 		request: viewerRequest,
 		url: new URL(viewerRequest.url),
 		connectingIp,

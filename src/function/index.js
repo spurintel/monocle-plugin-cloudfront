@@ -141,75 +141,71 @@ function one(c) {
 	return c && !(c.multiValue && c.multiValue.length > 1) ? c.value : '';
 }
 
-// Every path an origin might take the request path to mean: decoded up to twice,
-// with `;params` kept or dropped, backslashes turned to slashes or not, slashes
-// merged or not, dot segments resolved or not, cut at a decoded `?` or `#` or
-// not. Mirrors edge-core's pathReadings; the shared corpus pins them together.
-// Throws for what no ordinary client sends.
+// Every path an origin might take the request path to mean: decoding (up to twice),
+// cutting at a decoded `?` or `#`, dropping `;params`, turning backslashes to slashes,
+// merging slashes and resolving dot segments, taken in every order until nothing new
+// appears, since origins apply them in different orders. Mirrors edge-core's
+// pathReadings step for step; the shared corpus pins them together. Throws for what no
+// ordinary client sends.
 function readings(raw) {
 	if (typeof raw !== 'string' || Buffer.byteLength(raw, 'utf8') > 8192 || raw.charAt(0) !== '/' || /[\\\x00-\x1f\x7f?#]/.test(raw))
 		throw 1;
-	var forms = [],
-		form = raw,
-		depth = 0,
+	var seen = [raw],
+		at = [0],
+		pending = [raw],
+		out = [],
+		f,
+		n,
+		r,
 		d;
-	while (/%[0-9a-f]{2}/i.test(form)) {
-		if (depth === 2) throw 1;
-		try {
-			d = form.replace(/(?:%[0-9a-f]{2})+/gi, decodeURIComponent);
-		} catch (e) {
-			if (depth === 0) throw 1;
-			break;
-		}
-		if (/%(?:2f|5c|3b|3f|23|25|2e)/i.test(form)) forms.push(form);
-		form = d;
-		depth++;
+	function reach(p, k) {
+		if (seen.indexOf(p) !== -1) return;
+		if (seen.length === 256) throw 1;
+		seen.push(p);
+		at.push(k);
+		pending.push(p);
 	}
-	forms.push(form);
-	var out = [],
-		list,
-		i,
-		j,
-		f;
-	for (i = 0; i < forms.length; i++) {
-		if (/[\x00-\x1f\x7f]/.test(forms[i])) throw 1;
-		list = vary([forms[i]], /[?#]/, function (p) {
-			return p.replace(/[?#].*$/, '');
-		});
-		list = vary(list, /;/, function (p) {
-			return p
-				.split('/')
-				.map(function (s) {
-					return s.split(';')[0];
-				})
-				.join('/');
-		});
-		list = vary(list, /\\/, function (p) {
-			return p.replace(/\\/g, '/');
-		});
-		list = vary(list, /\/\//, function (p) {
-			return p.replace(/\/{2,}/g, '/');
-		});
-		list = vary(list, /\/\.\.?(?:\/|$)/, dots);
-		for (j = 0; j < list.length; j++) {
-			f = (list[j] || '/').replace(/[A-Z]+/g, function (s) {
+	while (pending.length) {
+		f = pending.pop();
+		n = at[seen.indexOf(f)];
+		if (/[\x00-\x1f\x7f]/.test(f)) throw 1;
+		r = true;
+		if (/%[0-9a-f]{2}/i.test(f)) {
+			if (n === 2) throw 1;
+			d = null;
+			try {
+				d = f.replace(/(?:%[0-9a-f]{2})+/gi, decodeURIComponent);
+			} catch (e) {
+				if (n === 0) throw 1;
+			}
+			if (d !== null) {
+				r = /%(?:2f|5c|3b|3f|23|25|2e)/i.test(f);
+				reach(d, n + 1);
+			}
+		}
+		if (r) {
+			d = (f || '/').replace(/[A-Z]+/g, function (s) {
 				return s.toLowerCase();
 			});
-			if (f.length > 1 && f.charAt(f.length - 1) === '/') f = f.slice(0, -1);
-			if (out.indexOf(f) === -1) out.push(f);
+			if (d.length > 1 && d.charAt(d.length - 1) === '/') d = d.slice(0, -1);
+			if (out.indexOf(d) === -1) out.push(d);
 		}
+		if (/[?#]/.test(f)) reach(f.replace(/[?#].*$/, ''), n);
+		if (f.indexOf(';') !== -1)
+			reach(
+				f
+					.split('/')
+					.map(function (s) {
+						return s.split(';')[0];
+					})
+					.join('/'),
+				n
+			);
+		if (f.indexOf('\\') !== -1) reach(f.replace(/\\/g, '/'), n);
+		if (f.indexOf('//') !== -1) reach(f.replace(/\/{2,}/g, '/'), n);
+		if (/\/\.\.?(?:\/|$)/.test(f)) reach(dots(f), n);
 	}
 	return out;
-}
-
-function vary(list, test, alt) {
-	var r = [],
-		i;
-	for (i = 0; i < list.length; i++) {
-		r.push(list[i]);
-		if (test.test(list[i])) r.push(alt(list[i]));
-	}
-	return r;
 }
 
 function dots(p) {
@@ -327,7 +323,9 @@ function openVerdict(sealed, key, aud, cv, bind) {
 		typeof p.jti !== 'string' ||
 		!p.jti ||
 		p.jti.length > 128 ||
-		p.clearanceVersion !== cv ||
+		// An empty version is a Lambda that could not read the store giving the ten-minute pass
+		// it gives when Policy cannot answer: an allow, and never a longer one.
+		(p.clearanceVersion !== cv && !(p.clearanceVersion === '' && p.verdict === 'allow' && p.exp <= now + 600)) ||
 		now >= p.exp ||
 		p.ip !== bind
 	)

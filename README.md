@@ -39,9 +39,10 @@ WebSocket handshake by its `Sec-WebSocket-Key`.
 
 The Lambda reads the KeyValueStore through its API, which can be throttled while the
 Function's edge copy still answers. A container keeps the runtime it last built, however old,
-when the store cannot be read. A cold one serves the challenge, resubmit and block pages and the
-script on defaults, and answers 503 only to state and verify, which cannot read or mint a cookie
-without the clearance version.
+when the store cannot be read, taking the clearance version if that much was read. A cold one
+serves every page on defaults, kept out of the shared cache, and verify gives the ten-minute
+pass it gives when Policy cannot answer, under an empty clearance version. The Function accepts
+that version for an allow of ten minutes or less, and for nothing else.
 
 The Function protects every hostname the distribution serves. CloudFront routes on the Host,
 so an alias the deployment does not list, or the `*.cloudfront.net` name, reaches the same

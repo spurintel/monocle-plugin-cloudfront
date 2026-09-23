@@ -26,7 +26,7 @@ export interface LiveConfig {
 	hosts: string[];
 	/**
 	 * The store could not be read and this container had nothing to fall back on, so the
-	 * rest is defaults. The clearance version is unknown: nothing may be minted or validated.
+	 * rest is defaults and the clearance version is unknown (empty).
 	 */
 	unread?: boolean;
 }
@@ -44,7 +44,9 @@ let cached: { until: number; identity: string; runtime: Runtime } | undefined;
  * rotation mints cookies the Function refuses, or reports a fresh one as absent.
  *
  * A store that cannot be read is ours to absorb: the runtime this container last built stands,
- * whatever its age. A container with none gets defaults marked `unread`.
+ * whatever its age, with the clearance version if that much was read, since verify mints
+ * against it and the Function validates against it. A container with none gets defaults,
+ * marked `unread` unless the clearance version was read.
  */
 export async function getRuntime(
 	baked: BakedConfig,
@@ -59,15 +61,16 @@ export async function getRuntime(
 		if (((await kvs.get('cv').catch(() => version)) ?? '') === version) return held.runtime;
 	}
 
-	let cv: string, cfgRaw: string, hostsRaw: string;
+	let cv: string | undefined, cfgRaw: string, hostsRaw: string;
 	try {
 		cv = (await kvs.get('cv')) ?? '';
 		cfgRaw = (await readChunks(kvs, 'cfg')) ?? '{}';
 		hostsRaw = (await readChunks(kvs, 'hosts')) ?? '[]';
 	} catch (error) {
 		console.warn(`monocle store unreadable: ${error instanceof Error ? error.name : 'unknown'}`);
-		if (held) return held.runtime;
-		return build(baked, '', '{}', '[]', true);
+		if (held && (cv === undefined || cv === held.runtime.clearanceVersion)) return held.runtime;
+		const live = held?.runtime.live;
+		return build(baked, cv ?? '', live?.cfgRaw ?? '{}', JSON.stringify(live?.hosts ?? []), cv === undefined);
 	}
 	const runtime = await build(baked, cv, cfgRaw, hostsRaw, false);
 	cached = { until: now + KVS_CACHE_MS, identity, runtime };
