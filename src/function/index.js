@@ -8,8 +8,10 @@ async function handler(event) {
 		var uri = typeof req.uri === 'string' ? req.uri : '/';
 		// Before any return: a viewer must not be able to hand the origin a
 		// contract header or one of our cookies just because a later check fails
-		// open. The verdict is read out first, since strip removes it.
-		var held = req.cookies && req.cookies['__Host-mcl_c'];
+		// open. The verdict and the assess marker are read out first, since strip
+		// removes them.
+		var held = one(req.cookies && req.cookies['__Host-mcl_c']);
+		var skipped = one(req.cookies && req.cookies['__Host-mcl_skip']);
 		strip(req);
 		var kvs = cf.kvs();
 		var ver = await g(kvs, 'v');
@@ -21,24 +23,46 @@ async function handler(event) {
 		// No host check: CloudFront routes on the Host, so every one that arrives is
 		// a name this distribution serves. An alias the deployment does not list, or
 		// the *.cloudfront.net name, reaches the same origin and is the same site.
-		var path;
+		var method = (req.method || 'GET').toUpperCase();
+		var safe = method === 'GET' || method === 'HEAD';
+		var paths, al;
 		try {
-			path = canon(uri);
+			paths = readings(uri);
+			al = routed(paths, !safe);
 		} catch (e) {
 			return resp(400, H('text/plain; charset=utf-8'), '');
 		}
-		if (path === '/__mcl' || path.indexOf('/__mcl/') === 0) return resp(404, H(), null);
-		var ck = held && held.multiValue && held.multiValue.length > 1 ? null : held;
-		var cookieVal = ck ? ck.value : '';
-		var hit = await resolve(kvs, path);
+		// Each reading an origin might serve is resolved and the strictest stands, as
+		// edge-core decides them one by one: enforced if any is, an infrastructure
+		// pass only if every covered reading is infrastructure, and an assessed
+		// reading that is not (asm) still challenges where an enforced one passes.
+		// The runtime rejects `await` in an argument position, so it stands alone.
+		var wRaw = await readChunks(kvs, 'w');
+		var w = wild(wRaw),
+			hit = null,
+			inf = true,
+			asm = false;
+		for (var i = 0; i < paths.length; i++) {
+			if (paths[i] === '/__mcl' || paths[i].indexOf('/__mcl/') === 0) return resp(404, H(), null);
+			var h = await resolve(kvs, paths[i], w);
+			if (h === 'e' || !hit) hit = h;
+			if (h && !infra(paths[i])) {
+				inf = false;
+				if (h === 'a') asm = true;
+			}
+		}
+		// An action a router may take the request to name adds its enforcement, and nothing else.
+		for (i = 0; i < al.length && hit !== 'e'; i++) {
+			h = await resolve(kvs, al[i], w);
+			if (h === 'e') hit = 'e';
+		}
 		if (!hit) return req;
-		var method = (req.method || 'GET').toUpperCase();
 		var hd = req.headers;
-		var ws = hd.upgrade && hd.upgrade.value.toLowerCase().indexOf('websocket') !== -1;
+		// CloudFront hides Upgrade from functions; every WebSocket handshake carries this.
+		var ws = !!hd['sec-websocket-key'];
 		var sec = hd['sec-fetch-mode'] ? hd['sec-fetch-mode'].value : '';
 		var acc = hd.accept ? hd.accept.value : '';
 		var nav = !ws && (sec.toLowerCase() === 'navigate' || acc.indexOf('application/xhtml+xml') !== -1);
-		var safe = method === 'GET' || method === 'HEAD';
 		var ip = event.viewer && event.viewer.ip ? event.viewer.ip : '';
 		var bind = binding(ip);
 		var cv = await g(kvs, 'cv');
@@ -48,32 +72,31 @@ async function handler(event) {
 		// Pass, marked, so the origin and a curl can see the store is
 		// inconsistent; the fix is the missing keys, never a challenge loop.
 		if (!id || !cv) return skip(req, 'config');
-		var verdict = cookieVal ? openVerdict(cookieVal, key, id, cv, bind) : null;
+		var verdict = held ? openVerdict(held, key, id, cv, bind) : null;
+		// An assessed path only ever wanted to observe, so it challenges only a
+		// visitor the challenge can help: not an unbindable address, and not one
+		// whose challenge page left its marker that our script failed them. The
+		// marker is theirs to forge, and is read nowhere a verdict is required.
+		var chal = !verdict && nav && safe && bind && !skipped;
 		if (safe && !ws) {
 			var botsRaw = await readChunks(kvs, 'bots');
 			if (botsRaw && inPacked(ip, botsRaw)) return req;
-			if (hit !== 'e' && infra(path)) return req;
+			if (hit !== 'e' && inf) return req;
 		}
 		// No preflight pass, unlike edge-core, which returns only a preflight's
 		// headers. A viewer-request Function cannot drop the origin's body, so an
 		// OPTIONS here needs a verdict like any other method.
 		if (hit === 'e') {
 			var ipsRaw = await readChunks(kvs, 'ips');
-			if (ipsRaw && inPacked(ip, ipsRaw)) return req;
-			if (verdict === 'block') return await blockResp(kvs, req, nav, method);
+			if (ipsRaw && inPacked(ip, ipsRaw) && !(asm && chal)) return req;
+			if (verdict === 'block') return await blockResp(kvs, req, nav, method, w);
 			if (verdict === 'allow') return req;
-			var brk = await g(kvs, 'brk');
-			if (brk && Math.floor(Date.now() / 1000) < parseInt(brk, 10)) {
-				req.headers['x-monocle-degraded'] = { value: '1' };
-				return req;
-			}
+			// Refused only for want of a verdict. Verify gives every visitor one
+			// unless Policy refused their own bundle: when Policy cannot answer, the
+			// Lambda passes them.
 			return refuse(req, method, nav, ws, safe, uri);
 		}
-		if (!verdict && nav && safe) {
-			var brk2 = await g(kvs, 'brk');
-			if (!(brk2 && Math.floor(Date.now() / 1000) < parseInt(brk2, 10)))
-				return bounce(503, challenge(uri, qstr(req.querystring)), method, 1);
-		}
+		if (chal) return bounce(503, challenge(uri, qstr(req.querystring)), method, 1);
 		return req;
 	} catch (e) {
 		return skip(req, 'error');
@@ -109,49 +132,149 @@ async function readChunks(kvs, key) {
 	return raw;
 }
 
+// Our headers and cookies, and the path overrides some stacks serve instead of
+// the path we assessed. No browser sends one.
 function strip(req) {
 	for (var n in req.headers) {
-		if (n.indexOf('x-monocle-') === 0 || n.indexOf('x-mcl-') === 0) delete req.headers[n];
+		if (/^x-(monocle|mcl)-|^x-(original|rewrite)-url$/.test(n)) delete req.headers[n];
 	}
 	if (!req.cookies) return;
-	for (var c in req.cookies) if (c.indexOf('__Host-mcl_') === 0) delete req.cookies[c];
+	for (var c in req.cookies) if (/^__(Host|Secure)-mcl_/.test(c)) delete req.cookies[c];
 }
 
-// True when an escape stands for an ASCII character we must not accept encoded:
-// one that changes how the path parses, one that could meet a wildcard segment,
-// or an unreserved one, where the escape is a second spelling of the literal.
-// Mirrors edge-core's canonicalizePath; the shared corpus pins them together.
-function aliased(raw) {
-	var re = /%([0-9a-f]{2})/gi,
+// A cookie's value, or '' when it is absent or sent more than once.
+function one(c) {
+	return c && !(c.multiValue && c.multiValue.length > 1) ? c.value : '';
+}
+
+// Every path an origin might take the request path to mean: decoding (up to twice),
+// decoding IIS's `%uXXXX`, cutting at a decoded `?` or `#`, dropping `;params`,
+// turning backslashes to slashes, merging slashes and resolving dot segments, taken
+// in every order until nothing new appears, since origins apply them in different
+// orders. Mirrors edge-core's
+// pathReadings step for step; the shared corpus pins them together. Throws for what no
+// ordinary client sends.
+function readings(raw) {
+	if (typeof raw !== 'string' || Buffer.byteLength(raw, 'utf8') > 8192 || raw.charAt(0) !== '/' || /[\\\x00-\x1f\x7f?#]/.test(raw))
+		throw 1;
+	var seen = [raw],
+		at = [0],
+		pending = [raw],
+		out = [],
+		sg = 0,
+		f,
+		n,
+		r,
+		d;
+	function reach(p, k) {
+		if (seen.indexOf(p) !== -1) return;
+		if (seen.length === 256) throw 1;
+		seen.push(p);
+		at.push(k);
+		pending.push(p);
+	}
+	while (pending.length) {
+		f = pending.pop();
+		n = at[seen.indexOf(f)];
+		if (/[\x00-\x1f\x7f]/.test(f)) throw 1;
+		r = true;
+		if (/%(?:2[0-9a-e]|[013-9a-f][0-9a-f])/i.test(f)) {
+			if (n === 2) throw 1;
+			d = null;
+			try {
+				d = f.replace(/(?:%(?:2[0-9a-e]|[013-9a-f][0-9a-f]))+/gi, decodeURIComponent);
+			} catch (e) {
+				if (n === 0) throw 1;
+			}
+			if (d !== null) {
+				r = /%(?:2f|5c|3b|3f|23|25|2e)/i.test(f);
+				reach(d, n + 1);
+			}
+		}
+		if (r) {
+			d = (f || '/').replace(/[A-Z]+/g, function (s) {
+				return s.toLowerCase();
+			});
+			if (d.length > 1 && d.charAt(d.length - 1) === '/') d = d.slice(0, -1);
+			if (out.indexOf(d) === -1) {
+				sg += d.split('/').length - 1;
+				if (sg > 512) throw 1;
+				out.push(d);
+			}
+		}
+		if (/%2f/i.test(f)) reach(f.replace(/%2f/gi, '/'), n);
+		if (/%u[0-9a-f]{4}/i.test(f))
+			reach(
+				f.replace(/%u([0-9a-f]{4})/gi, function (m, h) {
+					return String.fromCharCode(parseInt(h, 16));
+				}),
+				n
+			);
+		if (/[?#]/.test(f)) reach(f.replace(/[?#][\s\S]*$/, ''), n);
+		if (f.indexOf(';') !== -1)
+			reach(
+				f
+					.split('/')
+					.map(function (s) {
+						return s.split(';')[0];
+					})
+					.join('/'),
+				n
+			);
+		if (f.indexOf('\\') !== -1) reach(f.replace(/\\/g, '/'), n);
+		if (f.indexOf('//') !== -1) reach(f.replace(/\/{2,}/g, '/'), n);
+		if (/\/\.\.?(?:\/|$)/.test(f)) reach(dots(f), n);
+	}
+	return out;
+}
+
+// The actions a router may take the request to name beside its readings, as
+// edge-core's routedAliases gives them: a script named mid-path (PATH_INFO), and
+// for a request that changes something, the name without its format suffix. They
+// count against the readings' segment budget.
+function routed(paths, unsafe) {
+	var sg = 0,
+		out = [],
+		i,
 		m;
-	while ((m = re.exec(raw))) {
-		var code = parseInt(m[1], 16);
-		if (code <= 0x1f || code === 0x7f) return true;
-		var ch = String.fromCharCode(code);
-		if ('/\\?#;%*'.indexOf(ch) !== -1 || /[A-Za-z0-9\-._~]/.test(ch)) return true;
+	for (i = 0; i < paths.length; i++) sg += paths[i].split('/').length - 1;
+	function add(p) {
+		if (paths.indexOf(p) !== -1 || out.indexOf(p) !== -1) return;
+		sg += p.split('/').length - 1;
+		if (sg > 512) throw 1;
+		out.push(p);
 	}
-	return false;
+	for (i = 0; i < paths.length; i++) {
+		m = /^(.*?\.(?:php|as[hmp]x))\//.exec(paths[i]);
+		if (m) add(m[1]);
+		m = paths[i].replace(/\.[^/]*$/, '');
+		if (unsafe && m !== paths[i]) add(m.replace(/([\s\S])\/$/, '$1'));
+	}
+	return out;
 }
 
-function canon(raw) {
-	if (typeof raw !== 'string' || Buffer.byteLength(raw, 'utf8') > 8192 || raw.charAt(0) !== '/' || /[\\\x00-\x1f\x7f?#;]/.test(raw))
-		throw 1;
-	var d;
+function dots(p) {
+	var kept = [],
+		s = p.slice(1).split('/'),
+		i;
+	for (i = 0; i < s.length; i++) {
+		if (s[i] === '..') kept.pop();
+		else if (s[i] !== '.') kept.push(s[i]);
+	}
+	return '/' + kept.join('/');
+}
+
+// The wildcard patterns, read once per request. Unreadable is none.
+function wild(raw) {
 	try {
-		d = decodeURIComponent(raw);
+		var l = JSON.parse(raw);
+		return Array.isArray(l) ? l : [];
 	} catch (e) {
-		throw 1;
+		return [];
 	}
-	if (aliased(raw) || /[\\\x00-\x1f\x7f?#;%]/.test(d) || d.indexOf('//') !== -1) throw 1;
-	var segs = d.split('/');
-	for (var i = 1; i < segs.length; i++) if (segs[i] === '.' || segs[i] === '..') throw 1;
-	var f = d.replace(/[A-Z]+/g, function (s) {
-		return s.toLowerCase();
-	});
-	return f.length > 1 && f.charAt(f.length - 1) === '/' ? f.slice(0, -1) : f;
 }
 
-async function resolve(kvs, path) {
+async function resolve(kvs, path, w) {
 	var e = false,
 		a = false,
 		pHit = await g(kvs, 'p:' + path);
@@ -166,17 +289,11 @@ async function resolve(kvs, path) {
 		var i = cur.lastIndexOf('/');
 		cur = i <= 0 ? '/' : cur.slice(0, i);
 	}
-	var wRaw = await readChunks(kvs, 'w');
-	if (wRaw) {
-		try {
-			var list = JSON.parse(wRaw);
-			for (var j = 0; j < list.length && j < 100; j++) {
-				var w = list[j];
-				if (!w || typeof w.p !== 'string' || !matchWild(path, w.p)) continue;
-				if (w.e) e = true;
-				else a = true;
-			}
-		} catch (err) {}
+	for (var j = 0; j < w.length && j < 100; j++) {
+		var x = w[j];
+		if (!x || typeof x.p !== 'string' || !matchWild(path, x.p)) continue;
+		if (x.e) e = true;
+		else a = true;
 	}
 	return e ? 'e' : a ? 'a' : null;
 }
@@ -251,7 +368,11 @@ function openVerdict(sealed, key, aud, cv, bind) {
 		typeof p.jti !== 'string' ||
 		!p.jti ||
 		p.jti.length > 128 ||
-		p.clearanceVersion !== cv ||
+		// Another version stands only as the pass a Lambda that could not read the store gives, an
+		// allow with at most ten minutes left, or when minted in the last six minutes, by a Lambda
+		// that had not yet read a rotation.
+		(p.clearanceVersion !== cv &&
+			!(p.clearanceVersion === '' ? p.verdict === 'allow' && p.exp <= now + 600 : p.exp > now + ttl - 360)) ||
 		now >= p.exp ||
 		p.ip !== bind
 	)
@@ -281,13 +402,21 @@ function v4(s) {
 	return o;
 }
 
+// All eight groups as 32 hex digits, an embedded IPv4 tail as its two groups.
 function v6hex(addr) {
+	var m = /^(.*:)(\d+\.\d+\.\d+\.\d+)$/.exec(addr),
+		t;
+	if (m) {
+		t = v4(m[2]);
+		if (!t) return null;
+		addr = m[1] + (t[0] * 256 + t[1]).toString(16) + ':' + (t[2] * 256 + t[3]).toString(16);
+	}
 	var dc = addr.indexOf('::');
 	if (dc !== addr.lastIndexOf('::')) return null;
-	var head = (dc === -1 ? addr : addr.slice(0, dc)).split(':');
-	var tail = dc === -1 ? [] : addr.slice(dc + 2).split(':');
-	if (head[0] === '') head = [];
-	if (tail[0] === '') tail = [];
+	var hs = dc === -1 ? addr : addr.slice(0, dc),
+		ts = dc === -1 ? '' : addr.slice(dc + 2);
+	var head = hs === '' ? [] : hs.split(':');
+	var tail = ts === '' ? [] : ts.split(':');
 	var n = head.length + tail.length,
 		g = [],
 		i,
@@ -297,24 +426,32 @@ function v6hex(addr) {
 	for (z = 0; z < 8 - n; z++) g.push('0');
 	for (i = 0; i < tail.length; i++) g.push(tail[i]);
 	var hex = '';
-	for (i = 0; i < 4; i++) {
+	for (i = 0; i < 8; i++) {
 		if (!/^[0-9a-fA-F]{1,4}$/.test(g[i])) return null;
 		hex += ('000' + parseInt(g[i], 16).toString(16)).slice(-4);
 	}
 	return hex;
 }
 
+// An address as edge-core reads it: IPv4 octets, or IPv6 as 32 hex digits, with
+// an IPv4-mapped IPv6 address read as the IPv4 one. Null when malformed.
+function addr(ip) {
+	if (!ip || ip.length > 45 || ip.indexOf('%') !== -1) return null;
+	if (ip.indexOf(':') === -1) return v4(ip);
+	var h = v6hex(ip);
+	if (!h || h.indexOf('00000000000000000000ffff') !== 0) return h;
+	return [0, 2, 4, 6].map(function (i) {
+		return parseInt(h.substr(24 + i, 2), 16);
+	});
+}
+
 function binding(ip) {
-	if (!ip) return null;
-	if (ip.indexOf(':') === -1) {
-		var a = v4(ip);
-		return a ? a.join('.') : null;
-	}
-	var hex = v6hex(ip);
-	if (!hex) return null;
-	var g = [],
+	var a = addr(ip),
+		g = [],
 		i;
-	for (i = 0; i < 4; i++) g.push(parseInt(hex.slice(i * 4, i * 4 + 4), 16).toString(16));
+	if (!a) return null;
+	if (typeof a !== 'string') return a.join('.');
+	for (i = 0; i < 4; i++) g.push(parseInt(a.slice(i * 4, i * 4 + 4), 16).toString(16));
 	return g.join(':') + '::/64';
 }
 
@@ -327,12 +464,10 @@ function inPacked(ip, raw) {
 	}
 	if (!set || !set.v4 || !set.v6) return false;
 	if (typeof set.expiresAt === 'number' && Math.floor(Date.now() / 1000) >= set.expiresAt) return false;
-	if (ip.indexOf(':') === -1) {
-		var a = v4(ip);
-		return a ? has(set.v4, ((a[0] << 24) | (a[1] << 16) | (a[2] << 8) | a[3]) >>> 0) : false;
-	}
-	var hex = v6hex(ip);
-	return hex ? has(set.v6, hex) : false;
+	var a = addr(ip);
+	if (!a) return false;
+	// IPv6 ranges are packed /64-granular, as the upper 16 hex digits.
+	return typeof a === 'string' ? has(set.v6, a.slice(0, 16)) : has(set.v4, ((a[0] << 24) | (a[1] << 16) | (a[2] << 8) | a[3]) >>> 0);
 }
 
 function has(r, n) {
@@ -369,18 +504,18 @@ function resp(code, headers, body) {
 	return o;
 }
 
+// CloudFront hands keys and values over as the visitor sent them, still
+// percent-encoded, so they go back as they are; challenge() encodes the whole
+// return path once. A repeated parameter arrives as multiValue, and every
+// occurrence goes back.
 function qstr(qs) {
-	if (!qs) return '';
 	var p = [],
 		k,
 		i,
 		mv;
 	for (k in qs) {
-		// A repeated parameter arrives as multiValue; reading .value alone dropped
-		// every occurrence after the first from the page the visitor returns to.
-		mv = qs[k].multiValue;
-		if (mv && mv.length) for (i = 0; i < mv.length; i++) p.push(encodeURIComponent(k) + '=' + encodeURIComponent(mv[i].value));
-		else p.push(encodeURIComponent(k) + '=' + encodeURIComponent(qs[k].value));
+		mv = qs[k].multiValue || [qs[k]];
+		for (i = 0; i < mv.length; i++) p.push(k + '=' + mv[i].value);
 	}
 	return p.length ? '?' + p.join('&') : '';
 }
@@ -403,8 +538,14 @@ function bounce(code, to, method, retry) {
 	);
 }
 
+// A lone surrogate cannot be encoded, and a throw here would become the
+// catch-all's pass; the visitor is sent home after the challenge instead.
 function challenge(path, qs) {
-	return '/__mcl/challenge?return=' + encodeURIComponent(path + qs);
+	try {
+		return '/__mcl/challenge?return=' + encodeURIComponent(path + qs);
+	} catch (e) {
+		return '/__mcl/challenge?return=%2F';
+	}
 }
 
 // `uri` is the request's own path, not the canonical one: the canonical form is
@@ -424,26 +565,29 @@ function refuse(req, method, nav, ws, safe, uri) {
 }
 
 /**
- * Whether a blocked navigation may be sent to the configured page. The rule is
- * edge-core's safeReturn: a path on this host, never protocol-relative and never
+ * Whether a blocked navigation may be sent to the configured page. The rule is the one
+ * edge-core's safeReturn applies to a return path: a path on this host, never protocol-relative and never
  * one a browser folds into an off-site address (`/\\evil.example` resolves to
  * `https://evil.example/`). A target inside an enforced subtree is refused as
  * well, because blocking it would redirect to itself for ever.
  */
-async function redirectable(kvs, to) {
+async function redirectable(kvs, to, w) {
 	if (typeof to !== 'string' || to.charAt(0) !== '/' || to.indexOf('//') === 0) return false;
 	if (/[\\\x00-\x20]/.test(to) || to === '/__mcl' || to.indexOf('/__mcl/') === 0) return false;
-	var target;
+	var targets;
 	try {
-		target = canon(to);
+		targets = readings(to);
 	} catch (e) {
 		return false;
 	}
-	var hit = await resolve(kvs, target);
-	return hit !== 'e';
+	for (var i = 0; i < targets.length; i++) {
+		var hit = await resolve(kvs, targets[i], w);
+		if (hit === 'e') return false;
+	}
+	return true;
 }
 
-async function blockResp(kvs, req, nav, method) {
+async function blockResp(kvs, req, nav, method, w) {
 	var cfgRaw = await readChunks(kvs, 'cfg');
 	var cfg;
 	try {
@@ -461,7 +605,7 @@ async function blockResp(kvs, req, nav, method) {
 		);
 	// Kept out of the `if` head: this runtime rejects `await` in an argument
 	// position, and the minifier will move it there.
-	var mayRedirect = await redirectable(kvs, bp.redirect);
+	var mayRedirect = await redirectable(kvs, bp.redirect, w);
 	if (mayRedirect) {
 		var st = method === 'GET' || method === 'HEAD' ? 307 : 303;
 		return resp(st, H(null, { location: { value: bp.redirect } }), null);

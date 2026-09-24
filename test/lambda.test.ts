@@ -1,22 +1,25 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
 	COOKIE_SCOPE,
 	evaluateForEdge,
-	OPEN_GRACE_MS,
+	FAILURE_THRESHOLD,
+	mintVerdictCookie,
 	packCidrSet,
 	safeReturn,
 	scriptSegment,
+	UNVERIFIED_PASS_SECONDS,
 	validateVerdictCookie,
 } from '@spur.us/monocle-edge-core';
 
-import { persistingBreaker, resetBreaker } from '../src/lambda/breaker';
+import { resetBreaker } from '../src/lambda/breaker';
 import type { BakedConfig } from '../src/lambda/config';
 import { CRAWLER_FEEDS, refreshCrawlerRanges } from '../src/lambda/crawler';
 import { handleOriginRequest, handler } from '../src/lambda/index';
 import { MemoryKvs, readChunks, writeChunks } from '../src/lambda/kvs';
-import { resetRuntimeCache } from '../src/lambda/runtime';
-import { createHmacSealer } from '../src/shared/hmac-sealer';
+import { getRuntime, honoursClearance, resetRuntimeCache } from '../src/lambda/runtime';
+import { KVS_RETRY_MS, ROTATION_GRACE_SECONDS } from '../src/shared/constants';
+import { createHmacSealer } from '@spur.us/monocle-edge-core';
 
 const SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 const CV = 'ab'.repeat(32);
@@ -29,18 +32,13 @@ const BAKED: BakedConfig = {
 	publishableKey: 'pk_live_123',
 	deploymentId: ID,
 	kvsArn: 'arn:aws:cloudfront::123:key-value-store/abc',
+	hosts: ['www.example.com'],
 };
 
-/**
- * A deployment naming one hostname, which is what most of these cases are about.
- * Pass `hosts: '[]'` for the deployment that protects every hostname the
- * distribution serves.
- */
 function liveKvs(extra: Record<string, string> = {}) {
 	return new MemoryKvs({
 		cv: CV,
 		cfg: JSON.stringify({ session_tracking: 'off' }),
-		hosts: JSON.stringify(['www.example.com']),
 		...extra,
 	});
 }
@@ -123,7 +121,18 @@ function cookieValue(header: string, name: string): string | undefined {
 	return header.slice(name.length + 1, header.indexOf(';'));
 }
 
+// Nothing here may reach the network. A Policy call nobody stubbed fails as Policy being down,
+// which passes the visitor, so a test would go on passing while calling production.
+let offline: ReturnType<typeof vi.fn>;
+beforeEach(() => {
+	offline = vi.fn(async () => {
+		throw new Error('unstubbed fetch');
+	});
+	vi.stubGlobal('fetch', offline);
+});
+
 afterEach(() => {
+	expect(offline).not.toHaveBeenCalled();
 	vi.unstubAllGlobals();
 	vi.restoreAllMocks();
 	resetRuntimeCache();
@@ -161,26 +170,9 @@ describe('handleOriginRequest /__mcl/*', () => {
 		expect(JSON.parse(result.body ?? '{}').verdict).toBe('allow');
 	});
 
-	// A deployment protecting every hostname the distribution serves has no list to
-	// match an Origin against, so the browser's own same-origin statement is what
-	// stands in - and a cross-site caller cannot truthfully make it.
-	it('accepts a same-origin verify from any hostname when none are named', async () => {
-		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(policyResponse(true)));
-		const result = await handleOriginRequest(
-			originEvent({
-				body: { captchaData: 'bundle' },
-				headers: {
-					Origin: 'https://anything.example.com',
-					'Sec-Fetch-Site': 'same-origin',
-				},
-			}),
-			{ config: BAKED, kvs: liveKvs({ hosts: '[]' }) }
-		);
-		expect(result.status).toBe('200');
-	});
-
-	// The Function protects every name the distribution serves, so a visitor on an alias
-	// the list leaves out has to be able to pass the challenge there too.
+	// The Function protects every name the distribution serves, so a visitor on an alias added
+	// since deploy has to be able to pass the challenge there too. The browser's own same-origin
+	// statement stands in, and a cross-site caller cannot truthfully make it.
 	it('accepts a same-origin verify from an alias the host list does not name', async () => {
 		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(policyResponse(true)));
 		const result = await handleOriginRequest(
@@ -193,7 +185,7 @@ describe('handleOriginRequest /__mcl/*', () => {
 		expect(result.status).toBe('200');
 	});
 
-	it('still refuses a verify that does not claim same-origin when none are named', async () => {
+	it('still refuses a verify from another host that does not claim same-origin', async () => {
 		const fetchMock = vi.fn();
 		vi.stubGlobal('fetch', fetchMock);
 		for (const site of ['cross-site', 'same-site', 'none']) {
@@ -202,14 +194,14 @@ describe('handleOriginRequest /__mcl/*', () => {
 					body: { captchaData: 'bundle' },
 					headers: { Origin: 'https://attacker.example', 'Sec-Fetch-Site': site },
 				}),
-				{ config: BAKED, kvs: liveKvs({ hosts: '[]' }) }
+				{ config: BAKED, kvs: liveKvs() }
 			);
 			expect(result.status).toBe('403');
 		}
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
-	it('accepts verify Origin that matches a protected host in KVS', async () => {
+	it('accepts a verify Origin the deploy baked in', async () => {
 		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(policyResponse(true)));
 		const result = await handleOriginRequest(
 			originEvent({
@@ -218,7 +210,7 @@ describe('handleOriginRequest /__mcl/*', () => {
 				body: { captchaData: 'bundle' },
 				headers: { Origin: 'https://www.example.com' },
 			}),
-			{ config: BAKED, kvs: liveKvs({ hosts: JSON.stringify(['www.example.com']) }) }
+			{ config: BAKED, kvs: liveKvs() }
 		);
 		expect(result.status).toBe('200');
 	});
@@ -388,53 +380,58 @@ describe('fixes from the audit', () => {
 				body: { captchaData: 'bundle' },
 				headers: { Origin: 'https://origin.internal.example' },
 			}),
-			{ config: BAKED, kvs: liveKvs({ hosts: JSON.stringify(['www.example.com']) }) }
+			{ config: BAKED, kvs: liveKvs() }
 		);
 		expect(result.status).toBe('403');
 		expect(JSON.parse(result.body ?? '{}').error).toBe('origin');
 	});
 
-	it('persists the breaker on transitions only', async () => {
-		vi.stubGlobal(
-			'fetch',
-			vi.fn(async () => new Response('down', { status: 503 }))
-		);
+	// Our failure never answers the visitor. Nothing is written to the store: the pass
+	// travels in the visitor's own cookie, which the Function already opens.
+	it('passes the visitor for ten minutes when Policy cannot answer', async () => {
+		vi.stubGlobal('fetch', vi.fn(async () => new Response('down', { status: 503 })));
 		const kvs = liveKvs();
 		const update = vi.spyOn(kvs, 'update');
-		const verify = () =>
-			handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), { config: BAKED, kvs });
-		// Open the breaker from the outside; the next failure would write anyway.
-		for (let i = 0; i < 19; i++) await persistingBreaker(kvs).recordFailure();
-		await verify();
-		expect(kvs.store.brk).toBeDefined();
-		expect(Number(kvs.store.brk)).toBeGreaterThan(Math.floor(Date.now() / 1000));
-		expect(Number(kvs.store.brk)).toBeLessThanOrEqual(
-			Math.floor((Date.now() + OPEN_GRACE_MS) / 1000)
-		);
-		const writes = update.mock.calls.length;
-		await verify();
-		await verify();
-		expect(update.mock.calls.length).toBe(writes);
+		const result = await handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), {
+			config: BAKED,
+			kvs,
+		});
+		expect(result.status).toBe('200');
+		expect(setCookies(result)[0]).toContain(`Max-Age=${UNVERIFIED_PASS_SECONDS}`);
+		expect(update).not.toHaveBeenCalled();
 	});
 
-	// A failed half-open probe re-opens the breaker with a later deadline. Written only
-	// when it flipped, the store kept the first one, and the Function went back to
-	// refusing visitors about ninety seconds into an outage.
-	it('persists the new deadline when a failed probe re-opens the breaker', async () => {
+	it('stops asking a Policy that keeps failing, and still passes visitors', async () => {
+		const policy = vi.fn(async () => new Response('down', { status: 503 }));
+		vi.stubGlobal('fetch', policy);
+		const deps = { config: BAKED, kvs: liveKvs() };
+		const verify = () => handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), deps);
+		for (let i = 0; i < FAILURE_THRESHOLD; i++) await verify();
+		const asked = policy.mock.calls.length;
+		expect((await verify()).status).toBe('200');
+		expect(policy.mock.calls.length).toBe(asked);
+	});
+
+	// Every read is a billed KeyValueStore API call, and state is asked on every page view.
+	it('reads the store once per cache window, however often state and verify are asked', async () => {
+		vi.stubGlobal('fetch', vi.fn(async () => policyResponse(true)));
 		const kvs = liveKvs();
-		const breaker = persistingBreaker(kvs);
-		const opened = Date.now();
-		for (let i = 0; i < 20; i++) await breaker.recordFailure(opened);
-		expect(Number(kvs.store.brk)).toBe(Math.floor((opened + OPEN_GRACE_MS) / 1000));
-		const probe = opened + 20_000;
-		expect(await breaker.takeProbe(probe)).not.toBeNull();
-		await breaker.recordFailure(probe);
-		expect(Number(kvs.store.brk)).toBe(Math.floor((probe + OPEN_GRACE_MS) / 1000));
+		const deps = { config: BAKED, kvs };
+		const get = vi.spyOn(kvs, 'get');
+		await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), deps);
+		// The version, and the config with the probe for a second chunk: three billed calls.
+		expect(get.mock.calls.map(([key]) => key)).toEqual(['cv', 'cfg', 'cfg.1']);
+		get.mockClear();
+		for (let i = 0; i < 5; i++) {
+			await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), deps);
+			await handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), deps);
+		}
+		expect(get).not.toHaveBeenCalled();
 	});
 
-	// Verify mints against the clearance version. A container still holding the one
-	// from before a rotation minted cookies the Function refuses.
-	it('mints against a clearance version rotated inside the cache window', async () => {
+	// Until its window ends a container mints against the version it holds. The Function, and
+	// state and verify through honoursClearance, stand such a cookie for six minutes.
+	it('mints against the version it holds, which the edge honours across a rotation', async () => {
 		vi.stubGlobal('fetch', vi.fn(async () => policyResponse(true)));
 		const kvs = liveKvs();
 		const deps = { config: BAKED, kvs };
@@ -442,16 +439,297 @@ describe('fixes from the audit', () => {
 		const rotated = 'cd'.repeat(32);
 		kvs.store.cv = rotated;
 		const result = await handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), deps);
-		const value = cookieValue(setCookies(result)[0]!, COOKIE_SCOPE.names.verdict);
-		const state = await validateVerdictCookie({
+		const nowSeconds = Math.floor(Date.now() / 1000);
+		const read = (at: number, acceptsVersion?: typeof honoursClearance) =>
+			validateVerdictCookie({
+				sealer: createHmacSealer(SECRET),
+				audience: ID,
+				cookieValue: cookieValue(setCookies(result)[0]!, COOKIE_SCOPE.names.verdict),
+				ipBinding: IP,
+				nowSeconds: at,
+				clearanceVersion: rotated,
+				acceptsVersion,
+			});
+		expect((await read(nowSeconds, honoursClearance)).status).toBe('allow');
+		expect((await read(nowSeconds)).status).toBe('absent');
+		expect((await read(nowSeconds + ROTATION_GRACE_SECONDS + 1, honoursClearance)).status).toBe('absent');
+	});
+
+	// A store that cannot be read is ours. A container with a runtime keeps using it, however old;
+	// one without serves every page on defaults, and verify still asks Policy.
+	it('keeps the last runtime, whatever its age, when the store cannot be read', async () => {
+		const kvs = liveKvs();
+		const first = await getRuntime(BAKED, kvs, { now: 1_000 });
+		vi.spyOn(kvs, 'get').mockRejectedValue(new Error('ThrottlingException'));
+		expect(await getRuntime(BAKED, kvs, { now: 1_000 + 3_600_000 })).toBe(first);
+	});
+
+	// Each attempt may be billed, and a throttled store is only throttled harder.
+	it('asks a store it could not read again only after a pause', async () => {
+		const kvs = liveKvs();
+		const get = vi.spyOn(kvs, 'get').mockRejectedValue(new Error('ThrottlingException'));
+		const cold = await getRuntime(BAKED, kvs, { now: 1_000 });
+		expect(await getRuntime(BAKED, kvs, { now: 1_000 + KVS_RETRY_MS - 1 })).toBe(cold);
+		expect(get).toHaveBeenCalledTimes(1);
+		await getRuntime(BAKED, kvs, { now: 1_000 + KVS_RETRY_MS });
+		expect(get).toHaveBeenCalledTimes(2);
+	});
+
+	// Pages built from defaults are cached for no time, so the mark must outlast a partial read.
+	it('keeps a runtime built from defaults marked when a later read gets only the version', async () => {
+		const kvs = liveKvs();
+		const read = kvs.get.bind(kvs);
+		const get = vi.spyOn(kvs, 'get').mockRejectedValue(new Error('ThrottlingException'));
+		await getRuntime(BAKED, kvs, { now: 1_000 });
+		get.mockImplementation(async (key: string) => {
+			if (key === 'cv') return read(key);
+			throw new Error('ThrottlingException');
+		});
+		const runtime = await getRuntime(BAKED, kvs, { now: 1_000 + KVS_RETRY_MS });
+		expect(runtime.clearanceVersion).toBe(kvs.store.cv);
+		expect(runtime.live.defaults).toBe(true);
+	});
+
+	// The version was read and then the rest failed. The one held is from before a rotation, so
+	// keeping it mints cookies the Function, which reads the new one, refuses.
+	it('keeps a clearance version it read when the rest of the store fails', async () => {
+		const kvs = liveKvs();
+		await getRuntime(BAKED, kvs, { now: 1_000 });
+		const rotated = 'cd'.repeat(32);
+		kvs.store.cv = rotated;
+		const read = kvs.get.bind(kvs);
+		vi.spyOn(kvs, 'get').mockImplementation(async (key: string) => {
+			if (key === 'cv') return read(key);
+			throw new Error('ThrottlingException');
+		});
+		const runtime = await getRuntime(BAKED, kvs, { now: 1_000 + 3_600_000 });
+		expect(runtime.clearanceVersion).toBe(rotated);
+	});
+
+	it('serves the pages that need no store on a cold container that cannot read it', async () => {
+		const kvs = liveKvs();
+		vi.spyOn(kvs, 'get').mockRejectedValue(new Error('ThrottlingException'));
+		const deps = { config: BAKED, kvs };
+		for (const uri of ['/__mcl/challenge', '/__mcl/resubmit', '/__mcl/blocked'])
+			expect((await handleOriginRequest(originEvent({ uri, method: 'GET' }), deps)).status, uri).toMatch(/^(200|403)$/);
+		const segment = await scriptSegment(ID);
+		expect(
+			(await handleOriginRequest(originEvent({ uri: `/__mcl/${segment}/mcl.js`, method: 'GET' }), deps)).status
+		).toBe('200');
+		// CloudFront caches even a no-store page for its minimum TTL, under a key without the
+		// query, so the page carries nothing of this visitor's; built from defaults, it is cached
+		// for no longer than that.
+		const page = await handleOriginRequest(
+			originEvent({ uri: '/__mcl/challenge', method: 'GET', querystring: 'return=%2Freset%3Ftoken%3DSECRET' }),
+			deps
+		);
+		expect(page.headers?.['cache-control']?.[0]?.value).toBe('public, max-age=0');
+		expect(page.body).not.toContain('SECRET');
+		expect((await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), deps)).status).toBe('200');
+		// A visitor can make the store unreadable, so it never lets them skip Policy. The answer
+		// lasts ten minutes, under the empty version the Function accepts for that long only.
+		const policy = vi.fn(async () => policyResponse(true));
+		vi.stubGlobal('fetch', policy);
+		const verify = await handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), deps);
+		expect(verify.status).toBe('200');
+		expect(policy).toHaveBeenCalledOnce();
+		const value = cookieValue(setCookies(verify)[0]!, COOKIE_SCOPE.names.verdict);
+		const nowSeconds = Math.floor(Date.now() / 1000);
+		const pass = await validateVerdictCookie({
 			sealer: createHmacSealer(SECRET),
 			audience: ID,
 			cookieValue: value,
 			ipBinding: IP,
+			nowSeconds,
+			clearanceVersion: '',
+		});
+		expect(pass.status === 'allow' && pass.payload.exp).toBeLessThanOrEqual(nowSeconds + UNVERIFIED_PASS_SECONDS);
+	});
+
+	it('refuses a visitor Policy blocks on a cold container that cannot read the store', async () => {
+		const kvs = liveKvs();
+		vi.spyOn(kvs, 'get').mockRejectedValue(new Error('ThrottlingException'));
+		vi.stubGlobal('fetch', vi.fn(async () => policyResponse(false)));
+		const verify = await handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), { config: BAKED, kvs });
+		expect(verify.status).toBe('403');
+	});
+
+	// The version was read, so verify asks Policy as usual; only the pages are built from defaults.
+	it('caches pages for no time when the store gave its version but not its config', async () => {
+		const kvs = liveKvs();
+		const read = kvs.get.bind(kvs);
+		vi.spyOn(kvs, 'get').mockImplementation(async (key: string) => {
+			if (key === 'cv') return read(key);
+			throw new Error('ThrottlingException');
+		});
+		const deps = { config: BAKED, kvs };
+		const page = await handleOriginRequest(originEvent({ uri: '/__mcl/challenge', method: 'GET' }), deps);
+		expect(page.headers?.['cache-control']?.[0]?.value).toBe('public, max-age=0');
+		const policy = vi.fn(async () => policyResponse(true));
+		vi.stubGlobal('fetch', policy);
+		expect((await handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), deps)).status).toBe('200');
+		expect(policy).toHaveBeenCalled();
+	});
+
+	// The Origin list is baked at deploy, so a browser that sends no Sec-Fetch-Site can verify on
+	// the site's own name while the store cannot be read.
+	it('checks verify against the hosts baked at deploy when the store cannot be read', async () => {
+		vi.stubGlobal('fetch', vi.fn(async () => policyResponse(true)));
+		const kvs = liveKvs();
+		vi.spyOn(kvs, 'get').mockRejectedValue(new Error('ThrottlingException'));
+		const result = await handleOriginRequest(
+			originEvent({ body: { captchaData: 'bundle' }, distributionDomainName: 'd111.cloudfront.net' }),
+			{ config: { ...BAKED, hosts: ['www.example.com'] }, kvs }
+		);
+		expect(result.status).toBe('200');
+	});
+
+	// A deployment covering the whole distribution lists no hosts; its aliases are still the site.
+	it('checks verify against the names the distribution served at deploy', async () => {
+		vi.stubGlobal('fetch', vi.fn(async () => policyResponse(true)));
+		const result = await handleOriginRequest(
+			originEvent({ body: { captchaData: 'bundle' }, host: 'alias.example.com', distributionDomainName: 'd111.cloudfront.net' }),
+			{ config: { ...BAKED, hosts: ['alias.example.com', 'd111.cloudfront.net'] }, kvs: liveKvs() }
+		);
+		expect(result.status).not.toBe('403');
+	});
+
+	// CloudFront keeps one cache entry for GET and HEAD, so a HEAD must not fill the cached
+	// challenge page with an empty body.
+	it('answers a HEAD for a cached page as a GET', async () => {
+		const deps = { config: BAKED, kvs: liveKvs() };
+		const head = await handleOriginRequest(originEvent({ uri: '/__mcl/challenge', method: 'HEAD' }), deps);
+		expect(head.status).toBe('200');
+		expect(head.body).toBeTruthy();
+	});
+
+	// Another container's verify minted against the rotated version; the challenge page asks
+	// this one, still holding the old version, to confirm the cookie.
+	it('reads a cookie minted against a clearance version rotated inside the cache window', async () => {
+		const kvs = liveKvs();
+		const deps = { config: BAKED, kvs };
+		await handleOriginRequest(originEvent({ uri: '/__mcl/challenge', method: 'GET' }), deps);
+		const rotated = 'cd'.repeat(32);
+		kvs.store.cv = rotated;
+		const minted = await mintVerdictCookie({
+			sealer: createHmacSealer(SECRET),
+			audience: ID,
+			scope: COOKIE_SCOPE,
+			ipBinding: IP,
+			verdict: 'allow',
+			sid: 'sid-1',
+			jti: 'jti-1',
 			nowSeconds: Math.floor(Date.now() / 1000),
 			clearanceVersion: rotated,
 		});
+		const state = await handleOriginRequest(
+			originEvent({ uri: '/__mcl/state', method: 'GET', headers: { Cookie: minted.setCookie.split(';')[0]! } }),
+			deps
+		);
+		expect(JSON.parse(state.body ?? '{}').hint.verdict).toBe('allow');
+	});
+
+	// The Function reads a rotation before a warm container does, and refuses an allow on the
+	// old version minted more than six minutes ago. Handing that cookie back would send the
+	// visitor from the challenge to the page and back until the container read the store.
+	it('mints again for an allow the Function would refuse after a rotation', async () => {
+		const policy = vi.fn(async () => policyResponse(true));
+		vi.stubGlobal('fetch', policy);
+		const kvs = liveKvs();
+		const deps = { config: BAKED, kvs };
+		await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), deps);
+		kvs.store.cv = 'cd'.repeat(32);
+		const held = await mintVerdictCookie({
+			sealer: createHmacSealer(SECRET),
+			audience: ID,
+			scope: COOKIE_SCOPE,
+			ipBinding: IP,
+			verdict: 'allow',
+			sid: 'sid-1',
+			jti: 'jti-1',
+			nowSeconds: Math.floor(Date.now() / 1000) - 1800,
+			clearanceVersion: CV,
+		});
+		const result = await handleOriginRequest(
+			originEvent({ body: { captchaData: 'bundle' }, headers: { Cookie: held.setCookie.split(';')[0]! } }),
+			deps
+		);
+		expect(result.status).toBe('200');
+		expect(policy).toHaveBeenCalledOnce();
+		expect(cookieValue(setCookies(result)[0]!, COOKIE_SCOPE.names.verdict)).toBeTruthy();
+	});
+
+	// A verify already warm in this container keeps the version it holds when the store
+	// cannot answer the re-read, rather than failing the visitor.
+	it('verifies against the cached clearance version when the store cannot be read', async () => {
+		vi.stubGlobal('fetch', vi.fn(async () => policyResponse(true)));
+		const kvs = liveKvs();
+		const deps = { config: BAKED, kvs };
+		await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), deps);
+		vi.spyOn(kvs, 'get').mockRejectedValue(new Error('ThrottlingException'));
+		const result = await handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), deps);
+		expect(result.status).toBe('200');
+		const state = await validateVerdictCookie({
+			sealer: createHmacSealer(SECRET),
+			audience: ID,
+			cookieValue: cookieValue(setCookies(result)[0]!, COOKIE_SCOPE.names.verdict),
+			ipBinding: IP,
+			nowSeconds: Math.floor(Date.now() / 1000),
+			clearanceVersion: CV,
+		});
 		expect(state.status).toBe('allow');
+	});
+
+	// A Fetch header refuses text above U+00FF, and a site that keeps UTF-8 in its own
+	// cookies must not cost its visitors verify.
+	it('verifies a visitor whose site cookies hold UTF-8', async () => {
+		vi.stubGlobal('fetch', vi.fn(async () => policyResponse(true)));
+		const result = await handleOriginRequest(
+			originEvent({ body: { captchaData: 'bundle' }, headers: { Cookie: 'name=中文; theme=dark' } }),
+			{ config: BAKED, kvs: liveKvs() }
+		);
+		expect(result.status).toBe('200');
+		expect(setCookies(result)[0]).toContain(`${COOKIE_SCOPE.names.verdict}=`);
+	});
+
+	it('reads our own cookies from among the site cookies', async () => {
+		const kvs = liveKvs({ cfg: JSON.stringify({ session_tracking: 'session' }) });
+		const first = await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), {
+			config: BAKED,
+			kvs,
+		});
+		const sid = JSON.parse(first.body ?? '{}').sid as string;
+		const session = setCookies(first).find((h) => h.startsWith(`${COOKIE_SCOPE.names.session}=`))!.split(';')[0]!;
+		const again = await handleOriginRequest(
+			originEvent({
+				uri: '/__mcl/state',
+				method: 'GET',
+				headers: { Cookie: `name=中文; ${session}; theme=dark` },
+			}),
+			{ config: BAKED, kvs }
+		);
+		expect(JSON.parse(again.body ?? '{}').sid).toBe(sid);
+	});
+
+	// One UpdateKeys call takes 50 keys, and the refresh writes the snapshot in one call.
+	it('refuses a crawler snapshot too large for one store update', async () => {
+		// Every other /64, so no two ranges merge when packed, and within edge-core's 1,000.
+		const huge = Array.from({ length: 900 }, (_, i) => `2001:db8:0:${(i * 2).toString(16)}::/64`);
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async (url: string) =>
+				new Response(
+					JSON.stringify({
+						creationTime: new Date().toISOString(),
+						prefixes: url.includes('bing')
+							? [{ ipv4Prefix: '157.55.39.0/24' }]
+							: huge.map((ipv6Prefix) => ({ ipv6Prefix })),
+					}),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				)
+			)
+		);
+		await expect(refreshCrawlerRanges(new MemoryKvs())).rejects.toThrow(/one store update/);
 	});
 
 	it('writeChunks removes every stale continuation key', async () => {

@@ -3,9 +3,9 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 
 import { EDGE_CONTRACT_BANNER, stripForDeploy } from './strip.mjs';
 
-// The CloudFront Function is deployed AS-WRITTEN (src/function/index.js): the
-// runtime has a hard 10 KB source limit and no module system beyond its own
-// built-ins, so bundler wrappers would only burn budget. It is copied verbatim.
+// The CloudFront Function is not bundled: the runtime has a hard 10 KB source
+// limit and no module system beyond its own built-ins, so bundler wrappers would
+// only burn budget. strip.mjs minifies src/function/index.js on its own.
 const FUNCTION_SRC = 'src/function/index.js';
 const FUNCTION_MAX_BYTES = 10240;
 
@@ -14,21 +14,9 @@ mkdirSync('dist/lambda', { recursive: true });
 
 const functionSource = readFileSync(FUNCTION_SRC, 'utf8');
 
-// The CloudFront Functions runtime rejects `await` inside a function call's
-// arguments ("await in arguments not supported") — a COMPILE error that bricks
-// the whole function at the edge. Node runs `f(a, await g())` fine, so tests
-// can't catch it; guard the common comma-arg form at build time (on the SOURCE,
-// before stripping) instead.
-if (/,\s*await\b/.test(functionSource)) {
-	console.error(
-		'CloudFront Function has `await` inside call arguments (", await" found). ' +
-			'The runtime rejects this — resolve the await into its own statement first.'
-	);
-	process.exit(1);
-}
-
-// Deploy a comment/whitespace-stripped copy (see strip.mjs) so the readable,
-// heavily-commented source stays well under the hard 10 KB runtime limit.
+// Deploy a minified copy (see strip.mjs), which also refuses an `await` inside
+// call arguments, so the readable, heavily-commented source stays well under the
+// hard 10 KB runtime limit.
 const deployed = stripForDeploy(functionSource);
 const functionSize = Buffer.byteLength(deployed, 'utf8');
 if (functionSize > FUNCTION_MAX_BYTES) {
@@ -46,7 +34,7 @@ await build({
 	entryPoints: ['src/lambda/index.ts'],
 	bundle: true,
 	platform: 'node',
-	target: 'node20',
+	target: 'node24',
 	format: 'cjs',
 	outfile: 'dist/lambda/index.js',
 	external: ['./config.json'],
