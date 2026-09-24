@@ -16,7 +16,7 @@ Two runtimes split the work (see `src/`):
 | | CloudFront Function (`src/function/index.js`) | Lambda@Edge (`src/lambda/`) |
 |---|---|---|
 | Trigger | viewer-request on the default behavior and every customer behavior | origin-request on the `/__mcl/*` behaviors only |
-| Job | the guard ladder: path canonicalization, verdict cookie, crawler and allow-list passes, breaker, refusal shells | `/__mcl/state`, `/__mcl/verify` (Policy call and cookie minting), the challenge, resubmit and block pages, the resident script, the hourly crawler refresh |
+| Job | the guard ladder: path readings, verdict cookie, crawler and allow-list passes, refusal shells | `/__mcl/state`, `/__mcl/verify` (Policy call and cookie minting), the challenge, resubmit and block pages, the resident script, the hourly crawler refresh |
 | Cost and latency | sub-millisecond, runs on every request | runs only inside the challenge flow |
 
 **Flow**: a visitor without a valid decision opens an assessed page. The Function answers
@@ -26,7 +26,27 @@ an HMAC-sealed `__Host-mcl_c` cookie (allow one hour, block ten minutes), the pa
 the return path, and the Function passes the request through to **cache and origin
 untouched**. Enforced paths refuse a cookieless request by shape (challenge shell, resubmit
 shell, challenge JSON, or an empty 403 for WebSockets) and answer a block verdict with the
-customer's block page, redirect or JSON.
+customer's block page, redirect or JSON. Only Policy's verdict, or its refusal of the
+visitor's own bundle, answers a verify. When Policy cannot answer (down, slow, erroring, out
+of capacity, refusing our key or holding no policy for the deployment), the Lambda passes the
+visitor for ten minutes instead: our failure never answers them, and nothing about it is
+written to the store. When the challenge page cannot assess a visitor at all (our script did
+not load, or verify could not be reached), it sets a ten-minute `__Host-mcl_skip` cookie and
+returns once; an assessed path then serves them, and an enforced path ignores it.
+
+CloudFront hides the `Upgrade` header from edge functions, so the Function recognises a
+WebSocket handshake by its `Sec-WebSocket-Key`.
+
+The Lambda reads the KeyValueStore through its API, a billed call that can be throttled while
+the Function's edge copy still answers, so each container reads it at most once every five
+minutes. After a rotation a container can go on minting against the version it holds for those
+five minutes, so the Function, and state and verify, stand a cookie on another version while it
+is at most six minutes old. A container keeps the runtime it last built, however old, when the store cannot be
+read, taking the clearance version if that much was read. A cold one serves every page on
+defaults, cached for no longer than CloudFront's minimum TTL. Without a clearance version,
+verify still asks Policy and mints its answer for ten minutes under an empty one, which the
+Function accepts only for an allow with at most ten minutes left, so store trouble never lets a
+visitor skip Policy.
 
 The Function protects every hostname the distribution serves. CloudFront routes on the Host,
 so an alias the deployment does not list, or the `*.cloudfront.net` name, reaches the same
@@ -40,8 +60,9 @@ viewer-request Function can `return request`.
 ## Platform constraints this design encodes
 
 - **CloudFront Functions** ([runtime 2.0](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/functions-javascript-runtime-20.html)):
-  10 KB source limit (`build.mjs` and `test/function.test.ts` enforce it on the stripped
-  artifact), no network, no request body, crypto is `createHmac`/`createHash` only. So the
+  10 KB source limit (`build.mjs` and `test/function.test.ts` enforce it on the minified
+  artifact), no `await` inside call arguments (the build parses for it), no network, no
+  request body, crypto is `createHmac`/`createHash` only. So the
   cookie seal is HMAC-SHA256 over the edge core's v2 envelope, not AES-GCM, and the
   challenge page is not inlined: the Function serves a 300-byte shell that navigates to
   tier two. No injection is possible, so `injection` is always `off` on CloudFront.
@@ -73,7 +94,7 @@ viewer's Origin, Cookie and Sec-Fetch headers.
 
 Session tracking differs from the Worker in one place. The Worker tags the core URL with
 `cpd=<sid>` when it serves the challenge page or resident script; here both are cached and
-identical for every visitor, so `GET /__mcl/state` returns `{hint, degraded, sid}`, mints
+identical for every visitor, so `GET /__mcl/state` returns `{hint, sid}`, mints
 the session cookie when tracking is on and none is held, and the scripts append `cpd`
 themselves before loading the core. The session cookie is attribution only.
 
@@ -82,7 +103,6 @@ themselves before loading the core. The session cookie is attribution only.
 | Key | Value | Writer |
 |---|---|---|
 | `v` | `2` | dashboard |
-| `hosts` | Lambda only: JSON array of lowercase hostnames verify accepts an `Origin` from, besides the distribution's own domain and any browser stating `Sec-Fetch-Site: same-origin` | dashboard |
 | `k` | sealing key hex | dashboard |
 | `cv` | clearance version, 64 lowercase hex | dashboard |
 | `id` | deployment id, the cookie audience | dashboard |
@@ -92,7 +112,6 @@ themselves before loading the core. The session cookie is attribution only.
 | `p:<path>` | `e` enforced exact, `a` assessed exact | dashboard |
 | `s:<prefix>` | `e` enforced subtree, `a` assessed subtree | dashboard |
 | `bots` | packed crawler ranges plus `expiresAt` | Lambda, hourly |
-| `brk` | breaker open-until epoch seconds | Lambda, whenever the deadline moves |
 
 Route resolution is a walk: for `/a/b/c` the Function reads `p:/a/b/c`, then `s:/a/b/c`,
 `s:/a/b`, `s:/a`, `s:/`, then scans `w`. Enforcement applies if any `e` matches; assessment
@@ -106,9 +125,14 @@ if any `a` matches. There is no specificity contest between the two, as in the e
 	"cookieSecret": "<hex sealing key>",
 	"publishableKey": "<monocle publishable key>",
 	"deploymentId": "<app id>",
-	"kvsArn": "arn:aws:cloudfront::<account>:key-value-store/<id>"
+	"kvsArn": "arn:aws:cloudfront::<account>:key-value-store/<id>",
+	"hosts": ["<every name the distribution serves>"]
 }
 ```
+
+`hosts` is every name the distribution served at deploy, each the same site: verify accepts an
+`Origin` from them, from the distribution's own domain, and from any browser stating
+`Sec-Fetch-Site: same-origin`.
 
 The Lambda's execution role needs `cloudfront-keyvaluestore:DescribeKeyValueStore`,
 `GetKey` and `UpdateKeys` on that store. An EventBridge Scheduler rule invokes the same
@@ -122,7 +146,7 @@ npm test        # vitest: the 10 KB size gate, the strict-v3 path corpus run thr
                 # Function, the cross-pin that the Function opens what the Lambda mints,
                 # and the endpoint contract
 npm run build   # dist/function/index.js (stripped, size-checked, contract banner)
-                # dist/lambda/index.js  (esbuild CJS bundle for node20, contract banner)
+                # dist/lambda/index.js  (esbuild CJS bundle for node24, contract banner)
 ```
 
 Both artifacts begin with `// Monocle edge contract: 2`; the dashboard refuses artifacts
