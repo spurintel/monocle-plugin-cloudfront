@@ -1,7 +1,7 @@
 import { COOKIE_SCOPE, mintVerdictCookie, validateVerdictCookie } from '@spur.us/monocle-edge-core';
 import { describe, expect, it } from 'vitest';
 
-import { createHmacSealer } from '../src/shared/hmac-sealer';
+import { createHmacSealer } from '@spur.us/monocle-edge-core';
 
 const SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 const PREV = 'ff'.repeat(32);

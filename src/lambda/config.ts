@@ -14,6 +14,8 @@ export interface BakedConfig {
 	publishableKey: string;
 	deploymentId: string;
 	kvsArn: string;
+	/** Every name the distribution served at deploy, each the same site: verify's Origin list. */
+	hosts?: string[];
 }
 
 let cached: BakedConfig | null = null;

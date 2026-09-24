@@ -45,12 +45,12 @@ Resources:
               - "logs:CreateLogStream"
               - "logs:PutLogEvents"
             Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/*monocle-verify-*"
-          # The breaker state and the crawler snapshot.
+          # The live config verify reads, and the crawler snapshot the hourly
+          # refresh writes.
           - Effect: Allow
             Action:
               - "cloudfront-keyvaluestore:DescribeKeyValueStore"
               - "cloudfront-keyvaluestore:GetKey"
-              - "cloudfront-keyvaluestore:ListKeys"
               - "cloudfront-keyvaluestore:UpdateKeys"
             Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:key-value-store/*"
           # The scheduler role invokes the verify Lambda for the hourly refresh.
@@ -125,7 +125,8 @@ Resources:
               # monocle-*: rewriting the code of a customer function that merely
               # shares the prefix would run it under that function's own role.
               # EnableReplication is what CloudFront calls when the function is
-              # associated with the distribution.
+              # associated with the distribution, DisableReplication when it is
+              # removed; AWS lists both as required for Lambda@Edge.
               - Sid: VerifyLambda
                 Effect: Allow
                 Action:
@@ -136,11 +137,12 @@ Resources:
                   # UpdateFunctionCode is how a redeploy publishes a new version:
                   # an @Edge function attached to a distribution is replicated
                   # and cannot be deleted-and-recreated, so it is updated in
-                  # place. UpdateFunctionConfiguration is included for future
-                  # config changes that don't ship in the bundle.
+                  # place. Every redeploy also calls UpdateFunctionConfiguration,
+                  # which keeps the runtime and settings current.
                   - "lambda:UpdateFunctionCode"
                   - "lambda:UpdateFunctionConfiguration"
                   - "lambda:EnableReplication*"
+                  - "lambda:DisableReplication*"
                 Resource: !Sub "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:monocle-verify-*"
               # The FIRST Lambda@Edge association in an account makes AWS create
               # two service-linked roles (the Lambda replicator and the
@@ -157,7 +159,7 @@ Resources:
               # the scheduler's. Named precisely, never monocle-*, because a
               # role we did not create could otherwise be passed to our own
               # function, which is that role's permissions in our hands.
-              - Sid: LambdaRoleRead
+              - Sid: LambdaRoleReadDelete
                 Effect: Allow
                 Action:
                   - "iam:GetRole"
@@ -216,12 +218,18 @@ Resources:
                   - "scheduler:UpdateSchedule"
                   - "scheduler:DeleteSchedule"
                 Resource: !Sub "arn:aws:scheduler:us-east-1:${AWS::AccountId}:schedule/default/monocle-crawlers-*"
-              # Lets EventBridge Scheduler invoke the Lambda; removed on teardown.
+              # Lets EventBridge Scheduler invoke the Lambda, and nothing else; removed on
+              # teardown.
               - Sid: LambdaInvokePermission
                 Effect: Allow
-                Action:
-                  - "lambda:AddPermission"
-                  - "lambda:RemovePermission"
+                Action: "lambda:AddPermission"
+                Resource: !Sub "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:monocle-verify-*"
+                Condition:
+                  StringEquals:
+                    "lambda:Principal": "scheduler.amazonaws.com"
+              - Sid: LambdaRemovePermission
+                Effect: Allow
+                Action: "lambda:RemovePermission"
                 Resource: !Sub "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:monocle-verify-*"
               - Sid: SchedulerServiceLinkedRole
                 Effect: Allow
