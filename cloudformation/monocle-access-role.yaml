@@ -26,6 +26,38 @@ Parameters:
     Description: Name for the created role.
 
 Resources:
+  # The ceiling on every role this access role creates. IAM has no
+  # condition key for the CONTENTS of an inline policy, so PutRolePolicy alone
+  # could otherwise grant a role anything; a boundary caps the role's effective
+  # permissions no matter what is written onto it.
+  MonocleRoleBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${RoleName}-role-boundary"
+      Description: Maximum permissions any Monocle-created role may exercise.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Lambda@Edge writes its logs in the region nearest the viewer.
+          - Effect: Allow
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/*monocle-verify-*"
+          # The breaker state and the crawler snapshot.
+          - Effect: Allow
+            Action:
+              - "cloudfront-keyvaluestore:DescribeKeyValueStore"
+              - "cloudfront-keyvaluestore:GetKey"
+              - "cloudfront-keyvaluestore:ListKeys"
+              - "cloudfront-keyvaluestore:UpdateKeys"
+            Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:key-value-store/*"
+          # The scheduler role invokes the verify Lambda for the hourly refresh.
+          - Effect: Allow
+            Action: "lambda:InvokeFunction"
+            Resource: !Sub "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:monocle-verify-*"
+
   MonocleAccessRole:
     Type: AWS::IAM::Role
     Properties:
@@ -46,21 +78,29 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              # Read distributions (the picker) and update the chosen one to
-              # attach/detach Monocle's behaviors and function associations.
-              - Sid: Distributions
+              # These three accept no resource in IAM, so any narrower Resource
+              # denies them outright. Each lists, or creates something that does
+              # nothing until UpdateDistribution attaches it.
+              - Sid: Unscoped
                 Effect: Allow
                 Action:
                   - "cloudfront:ListDistributions"
+                  - "cloudfront:CreateFunction"
+                  - "cloudfront:CreateKeyValueStore"
+                Resource: "*"
+              # Read the chosen distribution and attach or detach Monocle's
+              # behaviors and function associations.
+              - Sid: Distributions
+                Effect: Allow
+                Action:
                   - "cloudfront:GetDistribution"
                   - "cloudfront:GetDistributionConfig"
                   - "cloudfront:UpdateDistribution"
-                Resource: "*"
+                Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/*"
               # Monocle's own edge resources, all named monocle-*.
               - Sid: EdgeFunction
                 Effect: Allow
                 Action:
-                  - "cloudfront:CreateFunction"
                   - "cloudfront:UpdateFunction"
                   - "cloudfront:PublishFunction"
                   - "cloudfront:DescribeFunction"
@@ -69,18 +109,21 @@ Resources:
               - Sid: KeyValueStore
                 Effect: Allow
                 Action:
-                  - "cloudfront:CreateKeyValueStore"
                   - "cloudfront:DescribeKeyValueStore"
                   - "cloudfront:DeleteKeyValueStore"
-                Resource: "*"
+                # A store's id is issued by AWS, so a template cannot name it;
+                # this at least keeps the grant inside this account.
+                Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:key-value-store/*"
               - Sid: KeyValueStoreData
                 Effect: Allow
                 Action:
                   - "cloudfront-keyvaluestore:DescribeKeyValueStore"
                   - "cloudfront-keyvaluestore:ListKeys"
                   - "cloudfront-keyvaluestore:UpdateKeys"
-                Resource: "*"
-              # The verify Lambda@Edge (us-east-1, monocle-* only).
+                Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:key-value-store/*"
+              # The verify Lambda@Edge (us-east-1). Named precisely, not
+              # monocle-*: rewriting the code of a customer function that merely
+              # shares the prefix would run it under that function's own role.
               # EnableReplication is what CloudFront calls when the function is
               # associated with the distribution.
               - Sid: VerifyLambda
@@ -98,7 +141,7 @@ Resources:
                   - "lambda:UpdateFunctionCode"
                   - "lambda:UpdateFunctionConfiguration"
                   - "lambda:EnableReplication*"
-                Resource: !Sub "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:monocle-*"
+                Resource: !Sub "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:monocle-verify-*"
               # The FIRST Lambda@Edge association in an account makes AWS create
               # two service-linked roles (the Lambda replicator and the
               # CloudFront logger); without this it fails with "not authorized
@@ -110,24 +153,60 @@ Resources:
                 Resource:
                   - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/replicator.lambda.amazonaws.com/*"
                   - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/logger.cloudfront.amazonaws.com/*"
-              # The Lambda's execution role (monocle-* only). PassRole is what
-              # lets the created role be attached to the Lambda; scoped so
-              # Monocle can never grant itself an unrelated role. PutRolePolicy
-              # is how the dashboard grants that role KeyValueStore Get/Update
-              # for the breaker and crawler snapshot.
-              - Sid: LambdaRole
+              # The two roles Monocle creates: the Lambda's execution role and
+              # the scheduler's. Named precisely, never monocle-*, because a
+              # role we did not create could otherwise be passed to our own
+              # function, which is that role's permissions in our hands.
+              - Sid: LambdaRoleRead
+                Effect: Allow
+                Action:
+                  - "iam:GetRole"
+                  - "iam:DeleteRole"
+                  - "iam:DetachRolePolicy"
+                  - "iam:DeleteRolePolicy"
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/monocle-edge-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/monocle-sched-*"
+              # Creating a role, granting it anything, repairing its trust
+              # policy or setting its boundary all require the boundary below,
+              # so no role we touch this way can exceed what the integration
+              # needs, however it came to exist.
+              - Sid: LambdaRoleWrite
                 Effect: Allow
                 Action:
                   - "iam:CreateRole"
-                  - "iam:DeleteRole"
-                  - "iam:GetRole"
-                  - "iam:PassRole"
-                  - "iam:AttachRolePolicy"
-                  - "iam:DetachRolePolicy"
                   - "iam:PutRolePolicy"
-                  - "iam:DeleteRolePolicy"
+                  - "iam:PutRolePermissionsBoundary"
                   - "iam:UpdateAssumeRolePolicy"
-                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/monocle-*"
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/monocle-edge-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/monocle-sched-*"
+                Condition:
+                  StringEquals:
+                    "iam:PermissionsBoundary": !Ref MonocleRoleBoundary
+              # The one AWS-managed policy the Lambda role needs. Without this
+              # condition the role could attach AdministratorAccess to a role it
+              # created and pass it to a function it also created.
+              - Sid: LambdaRoleAttachPolicy
+                Effect: Allow
+                Action: "iam:AttachRolePolicy"
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/monocle-edge-*"
+                Condition:
+                  ArnEquals:
+                    "iam:PolicyARN": "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+              # Handing a role to the services that run our code.
+              - Sid: LambdaRolePassRole
+                Effect: Allow
+                Action: "iam:PassRole"
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/monocle-edge-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/monocle-sched-*"
+                Condition:
+                  StringEquals:
+                    "iam:PassedToService":
+                      - "lambda.amazonaws.com"
+                      - "edgelambda.amazonaws.com"
+                      - "scheduler.amazonaws.com"
               # Hourly crawler refresh: EventBridge Scheduler in us-east-1
               # invokes the same Lambda the distribution uses at origin-request.
               - Sid: CrawlerSchedule
@@ -136,14 +215,14 @@ Resources:
                   - "scheduler:CreateSchedule"
                   - "scheduler:UpdateSchedule"
                   - "scheduler:DeleteSchedule"
-                Resource: !Sub "arn:aws:scheduler:us-east-1:${AWS::AccountId}:schedule/default/monocle-*"
+                Resource: !Sub "arn:aws:scheduler:us-east-1:${AWS::AccountId}:schedule/default/monocle-crawlers-*"
               # Lets EventBridge Scheduler invoke the Lambda; removed on teardown.
               - Sid: LambdaInvokePermission
                 Effect: Allow
                 Action:
                   - "lambda:AddPermission"
                   - "lambda:RemovePermission"
-                Resource: !Sub "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:monocle-*"
+                Resource: !Sub "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:monocle-verify-*"
               - Sid: SchedulerServiceLinkedRole
                 Effect: Allow
                 Action: "iam:CreateServiceLinkedRole"
@@ -153,3 +232,8 @@ Outputs:
   RoleArn:
     Description: Paste this into the Monocle dashboard's Connect AWS step.
     Value: !GetAtt MonocleAccessRole.Arn
+  RoleBoundaryArn:
+    Description: >-
+      The permissions boundary every Monocle-created role carries. The dashboard
+      sets it on each role it creates; nothing needs to be copied by hand.
+    Value: !Ref MonocleRoleBoundary

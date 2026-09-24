@@ -179,6 +179,20 @@ describe('handleOriginRequest /__mcl/*', () => {
 		expect(result.status).toBe('200');
 	});
 
+	// The Function protects every name the distribution serves, so a visitor on an alias
+	// the list leaves out has to be able to pass the challenge there too.
+	it('accepts a same-origin verify from an alias the host list does not name', async () => {
+		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(policyResponse(true)));
+		const result = await handleOriginRequest(
+			originEvent({
+				body: { captchaData: 'bundle' },
+				headers: { Origin: 'https://shop.example.com', 'Sec-Fetch-Site': 'same-origin' },
+			}),
+			{ config: BAKED, kvs: liveKvs() }
+		);
+		expect(result.status).toBe('200');
+	});
+
 	it('still refuses a verify that does not claim same-origin when none are named', async () => {
 		const fetchMock = vi.fn();
 		vi.stubGlobal('fetch', fetchMock);
@@ -401,6 +415,43 @@ describe('fixes from the audit', () => {
 		await verify();
 		await verify();
 		expect(update.mock.calls.length).toBe(writes);
+	});
+
+	// A failed half-open probe re-opens the breaker with a later deadline. Written only
+	// when it flipped, the store kept the first one, and the Function went back to
+	// refusing visitors about ninety seconds into an outage.
+	it('persists the new deadline when a failed probe re-opens the breaker', async () => {
+		const kvs = liveKvs();
+		const breaker = persistingBreaker(kvs);
+		const opened = Date.now();
+		for (let i = 0; i < 20; i++) await breaker.recordFailure(opened);
+		expect(Number(kvs.store.brk)).toBe(Math.floor((opened + OPEN_GRACE_MS) / 1000));
+		const probe = opened + 20_000;
+		expect(await breaker.takeProbe(probe)).not.toBeNull();
+		await breaker.recordFailure(probe);
+		expect(Number(kvs.store.brk)).toBe(Math.floor((probe + OPEN_GRACE_MS) / 1000));
+	});
+
+	// Verify mints against the clearance version. A container still holding the one
+	// from before a rotation minted cookies the Function refuses.
+	it('mints against a clearance version rotated inside the cache window', async () => {
+		vi.stubGlobal('fetch', vi.fn(async () => policyResponse(true)));
+		const kvs = liveKvs();
+		const deps = { config: BAKED, kvs };
+		await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), deps);
+		const rotated = 'cd'.repeat(32);
+		kvs.store.cv = rotated;
+		const result = await handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), deps);
+		const value = cookieValue(setCookies(result)[0]!, COOKIE_SCOPE.names.verdict);
+		const state = await validateVerdictCookie({
+			sealer: createHmacSealer(SECRET),
+			audience: ID,
+			cookieValue: value,
+			ipBinding: IP,
+			nowSeconds: Math.floor(Date.now() / 1000),
+			clearanceVersion: rotated,
+		});
+		expect(state.status).toBe('allow');
 	});
 
 	it('writeChunks removes every stale continuation key', async () => {

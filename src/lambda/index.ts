@@ -36,13 +36,17 @@ function isOriginRequest(event: unknown): event is CloudFrontOriginRequestEvent 
 }
 
 export async function handler(event: unknown, deps?: HandlerDeps): Promise<EdgeResponse | { ok: true }> {
+	// The schedule's own retry and dead-letter handling are the only thing watching
+	// the refresh, and they read a returned value as success. A refresh that failed
+	// must therefore fail the invocation: a snapshot silently left to expire stops
+	// exempting search engines a day later, with nothing logged to say why.
+	if (isCrawlerRefresh(event)) {
+		const config = deps?.config ?? loadConfig();
+		const kvs = deps?.kvs ?? createKvs(config.kvsArn);
+		await refreshCrawlerRanges(kvs);
+		return { ok: true };
+	}
 	try {
-		if (isCrawlerRefresh(event)) {
-			const config = deps?.config ?? loadConfig();
-			const kvs = deps?.kvs ?? createKvs(config.kvsArn);
-			await refreshCrawlerRanges(kvs);
-			return { ok: true };
-		}
 		if (!isOriginRequest(event)) {
 			console.error('Monocle Lambda received an unknown event shape');
 			return jsonResponse({ error: 'invalid' }, 400);
@@ -88,16 +92,13 @@ export async function handleOriginRequest(
 	// A body CloudFront truncated is never handed to verify: a fragment would parse as a bad bundle.
 	if (request.body?.inputTruncated) return jsonResponse({ error: 'invalid' }, 413);
 
-	const runtime = await getRuntime(config, kvs);
+	const runtime = await getRuntime(config, kvs, { freshClearance: canonicalPath === '/__mcl/verify' });
 	const connectingIp = request.clientIp || null;
 	const distributionDomain = record.cf.config?.distributionDomainName?.toLowerCase();
 	// The deployment's hosts, plus the distribution's own domain. Never the origin-request Host,
-	// which names the customer's origin, not a viewer host. A deployment naming no hostname has
-	// no list to match, so the browser's same-origin statement stands in.
-	const allowedOrigins =
-		runtime.live.hosts.length === 0
-			? 'same-origin'
-			: [...runtime.live.hosts, ...(distributionDomain ? [distributionDomain] : [])];
+	// which names the customer's origin, not a viewer host. An alias the list leaves out passes
+	// on the browser's same-origin statement, which edge-core accepts alongside the list.
+	const allowedOrigins = [...runtime.live.hosts, ...(distributionDomain ? [distributionDomain] : [])];
 	const viewerRequest = toRequest(request, distributionDomain ?? headerValue(request.headers, 'host') ?? 'localhost');
 	const response = await handleMclEndpoint(canonicalPath, {
 		runtime,

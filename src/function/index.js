@@ -6,34 +6,21 @@ async function handler(event) {
 	var req = event.request;
 	try {
 		var uri = typeof req.uri === 'string' ? req.uri : '/';
-		if (uri === '/__mcl' || uri.indexOf('/__mcl/') === 0) return req;
+		// Before any return: a viewer must not be able to hand the origin a
+		// contract header or one of our cookies just because a later check fails
+		// open. The verdict is read out first, since strip removes it.
+		var held = req.cookies && req.cookies['__Host-mcl_c'];
+		strip(req);
 		var kvs = cf.kvs();
 		var ver = await g(kvs, 'v');
 		var key = await g(kvs, 'k');
-		if (!key || ver !== '2') return req;
-		var host = req.headers.host ? req.headers.host.value : '';
-		var c = host.lastIndexOf(':');
-		if (c > 0 && host.indexOf(']') === -1) host = host.slice(0, c);
-		host = host.toLowerCase();
-		var hostsRaw = await readChunks(kvs, 'hosts');
-		// Absent is a store we cannot use, which fails open like the rest of them.
-		// An empty list is a deployment that says every hostname this distribution
-		// serves - a distribution is a site, so that is the safe default, and it
-		// covers an alias added long after setup.
-		if (!hostsRaw) return req;
-		var hosts;
-		try {
-			hosts = JSON.parse(hostsRaw);
-		} catch (e) {
-			return req;
-		}
-		// The distribution's own *.cloudfront.net name reaches the same origin and
-		// config, so an alias deployment would be bypassable through it. Treated as
-		// the configured host, not a second one; the Lambda's verify Origin agrees.
-		if (!Array.isArray(hosts)) return req;
-		var own = event.context && event.context.distributionDomainName;
-		if (hosts.length && hosts.indexOf(host) === -1 && host !== (own ? own.toLowerCase() : null))
-			return req;
+		// Buffer.from is lenient: a truncated or non-hex value would become a
+		// DIFFERENT key and reject every cookie the Lambda minted, leaving the
+		// visitor in a challenge loop. An unusable key fails open instead.
+		if (!key || !/^[0-9a-f]{64}$/i.test(key) || ver !== '2') return skip(req, 'config');
+		// No host check: CloudFront routes on the Host, so every one that arrives is
+		// a name this distribution serves. An alias the deployment does not list, or
+		// the *.cloudfront.net name, reaches the same origin and is the same site.
 		var path;
 		try {
 			path = canon(uri);
@@ -41,10 +28,8 @@ async function handler(event) {
 			return resp(400, H('text/plain; charset=utf-8'), '');
 		}
 		if (path === '/__mcl' || path.indexOf('/__mcl/') === 0) return resp(404, H(), null);
-		var ck = req.cookies && req.cookies['__Host-mcl_c'];
-		if (ck && ck.multiValue && ck.multiValue.length > 1) ck = null;
+		var ck = held && held.multiValue && held.multiValue.length > 1 ? null : held;
 		var cookieVal = ck ? ck.value : '';
-		strip(req);
 		var hit = await resolve(kvs, path);
 		if (!hit) return req;
 		var method = (req.method || 'GET').toUpperCase();
@@ -62,17 +47,16 @@ async function handler(event) {
 		// and a refusal would hit every visitor, not the ones the policy flags.
 		// Pass, marked, so the origin and a curl can see the store is
 		// inconsistent; the fix is the missing keys, never a challenge loop.
-		if (!id || !cv) {
-			req.headers['x-monocle-skip'] = { value: 'no-config' };
-			return req;
-		}
+		if (!id || !cv) return skip(req, 'config');
 		var verdict = cookieVal ? openVerdict(cookieVal, key, id, cv, bind) : null;
 		if (safe && !ws) {
 			var botsRaw = await readChunks(kvs, 'bots');
 			if (botsRaw && inPacked(ip, botsRaw)) return req;
 			if (hit !== 'e' && infra(path)) return req;
 		}
-		if (method === 'OPTIONS') return req;
+		// No preflight pass, unlike edge-core, which returns only a preflight's
+		// headers. A viewer-request Function cannot drop the origin's body, so an
+		// OPTIONS here needs a verdict like any other method.
 		if (hit === 'e') {
 			var ipsRaw = await readChunks(kvs, 'ips');
 			if (ipsRaw && inPacked(ip, ipsRaw)) return req;
@@ -83,17 +67,24 @@ async function handler(event) {
 				req.headers['x-monocle-degraded'] = { value: '1' };
 				return req;
 			}
-			return refuse(req, method, nav, ws, safe, path);
+			return refuse(req, method, nav, ws, safe, uri);
 		}
 		if (!verdict && nav && safe) {
 			var brk2 = await g(kvs, 'brk');
 			if (!(brk2 && Math.floor(Date.now() / 1000) < parseInt(brk2, 10)))
-				return bounce(503, challenge(path, qstr(req.querystring)), method, 1);
+				return bounce(503, challenge(uri, qstr(req.querystring)), method, 1);
 		}
 		return req;
 	} catch (e) {
-		return req;
+		return skip(req, 'error');
 	}
+}
+
+// A pass through with Monocle out of the way, marked for the origin. strip()
+// has already removed any value the viewer sent under this name.
+function skip(req, why) {
+	req.headers['x-monocle-skip'] = { value: why };
+	return req;
 }
 
 async function g(kvs, key) {
@@ -126,8 +117,24 @@ function strip(req) {
 	for (var c in req.cookies) if (c.indexOf('__Host-mcl_') === 0) delete req.cookies[c];
 }
 
+// True when an escape stands for an ASCII character we must not accept encoded:
+// one that changes how the path parses, one that could meet a wildcard segment,
+// or an unreserved one, where the escape is a second spelling of the literal.
+// Mirrors edge-core's canonicalizePath; the shared corpus pins them together.
+function aliased(raw) {
+	var re = /%([0-9a-f]{2})/gi,
+		m;
+	while ((m = re.exec(raw))) {
+		var code = parseInt(m[1], 16);
+		if (code <= 0x1f || code === 0x7f) return true;
+		var ch = String.fromCharCode(code);
+		if ('/\\?#;%*'.indexOf(ch) !== -1 || /[A-Za-z0-9\-._~]/.test(ch)) return true;
+	}
+	return false;
+}
+
 function canon(raw) {
-	if (typeof raw !== 'string' || Buffer.byteLength(raw, 'utf8') > 8192 || raw.charAt(0) !== '/' || /[\\\x00-\x20\x7f?#;]/.test(raw))
+	if (typeof raw !== 'string' || Buffer.byteLength(raw, 'utf8') > 8192 || raw.charAt(0) !== '/' || /[\\\x00-\x1f\x7f?#;]/.test(raw))
 		throw 1;
 	var d;
 	try {
@@ -135,7 +142,7 @@ function canon(raw) {
 	} catch (e) {
 		throw 1;
 	}
-	if (/%(?:[0-7][0-9a-f])/i.test(raw) || /[\\\x00-\x20\x7f?#;%]/.test(d) || d.indexOf('//') !== -1) throw 1;
+	if (aliased(raw) || /[\\\x00-\x1f\x7f?#;%]/.test(d) || d.indexOf('//') !== -1) throw 1;
 	var segs = d.split('/');
 	for (var i = 1; i < segs.length; i++) if (segs[i] === '.' || segs[i] === '..') throw 1;
 	var f = d.replace(/[A-Z]+/g, function (s) {
@@ -365,8 +372,16 @@ function resp(code, headers, body) {
 function qstr(qs) {
 	if (!qs) return '';
 	var p = [],
-		k;
-	for (k in qs) p.push(encodeURIComponent(k) + '=' + encodeURIComponent(qs[k].value));
+		k,
+		i,
+		mv;
+	for (k in qs) {
+		// A repeated parameter arrives as multiValue; reading .value alone dropped
+		// every occurrence after the first from the page the visitor returns to.
+		mv = qs[k].multiValue;
+		if (mv && mv.length) for (i = 0; i < mv.length; i++) p.push(encodeURIComponent(k) + '=' + encodeURIComponent(mv[i].value));
+		else p.push(encodeURIComponent(k) + '=' + encodeURIComponent(qs[k].value));
+	}
 	return p.length ? '?' + p.join('&') : '';
 }
 
@@ -392,9 +407,12 @@ function challenge(path, qs) {
 	return '/__mcl/challenge?return=' + encodeURIComponent(path + qs);
 }
 
-function refuse(req, method, nav, ws, safe, path) {
+// `uri` is the request's own path, not the canonical one: the canonical form is
+// lower-cased and slash-trimmed for comparison, and sending a visitor back to it
+// 404s on any origin that treats paths as case-sensitive.
+function refuse(req, method, nav, ws, safe, uri) {
 	if (ws) return resp(403, H(), null);
-	if (nav && safe) return bounce(503, challenge(path, qstr(req.querystring)), method, 1);
+	if (nav && safe) return bounce(503, challenge(uri, qstr(req.querystring)), method, 1);
 	if (nav && (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE'))
 		return bounce(403, '/__mcl/resubmit', method, 0);
 	var ch = safe || method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
@@ -403,6 +421,26 @@ function refuse(req, method, nav, ws, safe, path) {
 		H('application/json', ch ? { 'x-monocle-challenge-required': { value: '1' } } : null),
 		method === 'HEAD' ? null : '{"challenge":true}'
 	);
+}
+
+/**
+ * Whether a blocked navigation may be sent to the configured page. The rule is
+ * edge-core's safeReturn: a path on this host, never protocol-relative and never
+ * one a browser folds into an off-site address (`/\\evil.example` resolves to
+ * `https://evil.example/`). A target inside an enforced subtree is refused as
+ * well, because blocking it would redirect to itself for ever.
+ */
+async function redirectable(kvs, to) {
+	if (typeof to !== 'string' || to.charAt(0) !== '/' || to.indexOf('//') === 0) return false;
+	if (/[\\\x00-\x20]/.test(to) || to === '/__mcl' || to.indexOf('/__mcl/') === 0) return false;
+	var target;
+	try {
+		target = canon(to);
+	} catch (e) {
+		return false;
+	}
+	var hit = await resolve(kvs, target);
+	return hit !== 'e';
 }
 
 async function blockResp(kvs, req, nav, method) {
@@ -421,7 +459,10 @@ async function blockResp(kvs, req, nav, method) {
 			H('application/json', { 'x-monocle-blocked': { value: '1' } }),
 			method === 'HEAD' ? null : '{"blocked":true,"reason":"policy_block"}'
 		);
-	if (bp.redirect && typeof bp.redirect === 'string' && bp.redirect.charAt(0) === '/' && bp.redirect.indexOf('//') !== 0) {
+	// Kept out of the `if` head: this runtime rejects `await` in an argument
+	// position, and the minifier will move it there.
+	var mayRedirect = await redirectable(kvs, bp.redirect);
+	if (mayRedirect) {
 		var st = method === 'GET' || method === 'HEAD' ? 307 : 303;
 		return resp(st, H(null, { location: { value: bp.redirect } }), null);
 	}
