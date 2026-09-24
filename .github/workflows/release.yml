@@ -82,3 +82,6 @@ jobs:
             function.js
             lambda.js
           generate_release_notes: true
+          # A suffixed tag (v2.0.0-rc.1) is a pre-release, which GitHub never
+          # marks as the latest release.
+          prerelease: ${{ contains(github.ref_name, '-') }}
