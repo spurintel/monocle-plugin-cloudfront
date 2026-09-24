@@ -14,7 +14,7 @@ import {
 } from '@spur.us/monocle-edge-core';
 
 import { SCRIPT_CACHE_SECONDS } from '../shared/constants';
-import { containerBreaker, UNREAD_BREAKER } from './breaker';
+import { containerBreaker } from './breaker';
 import { loadConfig, type BakedConfig } from './config';
 import { refreshCrawlerRanges } from './crawler';
 import { edgeResponse, fromResponse, headerValue, jsonResponse, toHeaders, toRequest } from './http';
@@ -93,10 +93,6 @@ export async function handleOriginRequest(
 	if (request.body?.inputTruncated) return jsonResponse({ error: 'invalid' }, 413);
 
 	const runtime = await getRuntime(config, kvs);
-	// A store this container cannot read is ours to absorb. The clearance version is unknown,
-	// so verify gives the ten-minute pass it gives when Policy cannot answer, under the empty
-	// version the Function accepts for that pass alone.
-	const unread = runtime.live.unread === true;
 	const connectingIp = request.clientIp || null;
 	const distributionDomain = record.cf.config?.distributionDomainName?.toLowerCase();
 	// The distribution's names at deploy, the deployment's own among them, and its domain. Never
@@ -118,7 +114,7 @@ export async function handleOriginRequest(
 		// the shared kind, carrying nothing of one visitor's. Built from defaults, they may be
 		// wrong for the site, so they are cached for no longer than that minimum.
 		platform: {
-			breaker: unread ? UNREAD_BREAKER : containerBreaker(),
+			breaker: containerBreaker(),
 			sharedPages: { maxAgeSeconds: runtime.live.defaults ? 0 : SCRIPT_CACHE_SECONDS },
 			acceptsClearance: honoursClearance,
 		},

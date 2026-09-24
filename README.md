@@ -43,9 +43,10 @@ minutes. After a rotation a container can go on minting against the version it h
 five minutes, so the Function, and state and verify, stand a cookie on another version while it
 is at most six minutes old. A container keeps the runtime it last built, however old, when the store cannot be
 read, taking the clearance version if that much was read. A cold one serves every page on
-defaults, cached for no longer than CloudFront's minimum TTL, and verify gives the ten-minute
-pass it gives when Policy cannot answer, under an empty clearance version. The Function accepts
-that version for an allow with at most ten minutes left.
+defaults, cached for no longer than CloudFront's minimum TTL. Without a clearance version,
+verify still asks Policy and mints its answer for ten minutes under an empty one, which the
+Function accepts only for an allow with at most ten minutes left, so store trouble never lets a
+visitor skip Policy.
 
 The Function protects every hostname the distribution serves. CloudFront routes on the Host,
 so an alias the deployment does not list, or the `*.cloudfront.net` name, reaches the same

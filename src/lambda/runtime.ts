@@ -27,11 +27,6 @@ export interface LiveConfig {
 	customDomain?: string;
 	clearanceVersion: string;
 	cfgRaw: string;
-	/**
-	 * The store could not be read and this container had nothing to fall back on, so the
-	 * rest is defaults and the clearance version is unknown (empty).
-	 */
-	unread?: boolean;
 	/** Built without the store's config, so pages from it may be wrong for this site. */
 	defaults?: boolean;
 }
@@ -51,8 +46,10 @@ let cached: { until: number; identity: string; runtime: Runtime } | undefined;
  *
  * A store that cannot be read is ours to absorb: the runtime this container last built stands,
  * whatever its age, with the clearance version if that much was read, since verify mints
- * against it and the Function validates against it. A container with none gets defaults,
- * marked `unread` unless the clearance version was read. The store is asked again only after
+ * against it and the Function validates against it. A container with none gets defaults, and
+ * an empty clearance version unless it read one: verify still asks Policy, and core mints its
+ * answer for ten minutes, which the Function accepts under an empty version. A visitor who
+ * makes the store unreadable never skips Policy. The store is asked again only after
  * `KVS_RETRY_MS`, not on every request: each attempt may be billed, and a throttled store is
  * only throttled harder.
  */
@@ -76,7 +73,6 @@ export async function getRuntime(
 			held && (cv === undefined || cv === held.runtime.clearanceVersion)
 				? held.runtime
 				: await build(baked, cv ?? '', live?.cfgRaw ?? '{}', {
-						unread: cv === undefined,
 						defaults: !live || live.defaults === true,
 					});
 		cached = { until: now + KVS_RETRY_MS, identity, runtime };
@@ -91,7 +87,7 @@ async function build(
 	baked: BakedConfig,
 	cv: string,
 	cfgRaw: string,
-	{ unread = false, defaults = false }: { unread?: boolean; defaults?: boolean }
+	{ defaults = false }: { defaults?: boolean }
 ): Promise<Runtime> {
 	let parsed: { session_tracking?: unknown; block_page?: unknown; custom_domain?: unknown } = {};
 	try {
@@ -107,7 +103,6 @@ async function build(
 		customDomain,
 		clearanceVersion: cv,
 		cfgRaw,
-		...(unread && { unread }),
 		...(defaults && { defaults }),
 	};
 	const coreHost = customDomain ?? DEFAULT_CORE_HOST;

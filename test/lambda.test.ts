@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
 	COOKIE_SCOPE,
@@ -121,7 +121,18 @@ function cookieValue(header: string, name: string): string | undefined {
 	return header.slice(name.length + 1, header.indexOf(';'));
 }
 
+// Nothing here may reach the network. A Policy call nobody stubbed fails as Policy being down,
+// which passes the visitor, so a test would go on passing while calling production.
+let offline: ReturnType<typeof vi.fn>;
+beforeEach(() => {
+	offline = vi.fn(async () => {
+		throw new Error('unstubbed fetch');
+	});
+	vi.stubGlobal('fetch', offline);
+});
+
 afterEach(() => {
+	expect(offline).not.toHaveBeenCalled();
 	vi.unstubAllGlobals();
 	vi.restoreAllMocks();
 	resetRuntimeCache();
@@ -445,8 +456,7 @@ describe('fixes from the audit', () => {
 	});
 
 	// A store that cannot be read is ours. A container with a runtime keeps using it, however old;
-	// one without serves every page, and verify gives the ten-minute pass it gives when Policy
-	// cannot answer, under the empty clearance version the Function accepts for that pass alone.
+	// one without serves every page on defaults, and verify still asks Policy.
 	it('keeps the last runtime, whatever its age, when the store cannot be read', async () => {
 		const kvs = liveKvs();
 		const first = await getRuntime(BAKED, kvs, { now: 1_000 });
@@ -477,7 +487,6 @@ describe('fixes from the audit', () => {
 		});
 		const runtime = await getRuntime(BAKED, kvs, { now: 1_000 + KVS_RETRY_MS });
 		expect(runtime.clearanceVersion).toBe(kvs.store.cv);
-		expect(runtime.live.unread).toBeUndefined();
 		expect(runtime.live.defaults).toBe(true);
 	});
 
@@ -495,7 +504,6 @@ describe('fixes from the audit', () => {
 		});
 		const runtime = await getRuntime(BAKED, kvs, { now: 1_000 + 3_600_000 });
 		expect(runtime.clearanceVersion).toBe(rotated);
-		expect(runtime.live.unread).toBeUndefined();
 	});
 
 	it('serves the pages that need no store on a cold container that cannot read it', async () => {
@@ -518,21 +526,32 @@ describe('fixes from the audit', () => {
 		expect(page.headers?.['cache-control']?.[0]?.value).toBe('public, max-age=0');
 		expect(page.body).not.toContain('SECRET');
 		expect((await handleOriginRequest(originEvent({ uri: '/__mcl/state', method: 'GET' }), deps)).status).toBe('200');
-		const policy = vi.fn();
+		// A visitor can make the store unreadable, so it never lets them skip Policy. The answer
+		// lasts ten minutes, under the empty version the Function accepts for that long only.
+		const policy = vi.fn(async () => policyResponse(true));
 		vi.stubGlobal('fetch', policy);
 		const verify = await handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), deps);
 		expect(verify.status).toBe('200');
-		expect(policy).not.toHaveBeenCalled();
+		expect(policy).toHaveBeenCalledOnce();
 		const value = cookieValue(setCookies(verify)[0]!, COOKIE_SCOPE.names.verdict);
+		const nowSeconds = Math.floor(Date.now() / 1000);
 		const pass = await validateVerdictCookie({
 			sealer: createHmacSealer(SECRET),
 			audience: ID,
 			cookieValue: value,
 			ipBinding: IP,
-			nowSeconds: Math.floor(Date.now() / 1000),
+			nowSeconds,
 			clearanceVersion: '',
 		});
-		expect(pass.status).toBe('allow');
+		expect(pass.status === 'allow' && pass.payload.exp).toBeLessThanOrEqual(nowSeconds + UNVERIFIED_PASS_SECONDS);
+	});
+
+	it('refuses a visitor Policy blocks on a cold container that cannot read the store', async () => {
+		const kvs = liveKvs();
+		vi.spyOn(kvs, 'get').mockRejectedValue(new Error('ThrottlingException'));
+		vi.stubGlobal('fetch', vi.fn(async () => policyResponse(false)));
+		const verify = await handleOriginRequest(originEvent({ body: { captchaData: 'bundle' } }), { config: BAKED, kvs });
+		expect(verify.status).toBe('403');
 	});
 
 	// The version was read, so verify asks Policy as usual; only the pages are built from defaults.
@@ -555,6 +574,7 @@ describe('fixes from the audit', () => {
 	// The Origin list is baked at deploy, so a browser that sends no Sec-Fetch-Site can verify on
 	// the site's own name while the store cannot be read.
 	it('checks verify against the hosts baked at deploy when the store cannot be read', async () => {
+		vi.stubGlobal('fetch', vi.fn(async () => policyResponse(true)));
 		const kvs = liveKvs();
 		vi.spyOn(kvs, 'get').mockRejectedValue(new Error('ThrottlingException'));
 		const result = await handleOriginRequest(
@@ -566,6 +586,7 @@ describe('fixes from the audit', () => {
 
 	// A deployment covering the whole distribution lists no hosts; its aliases are still the site.
 	it('checks verify against the names the distribution served at deploy', async () => {
+		vi.stubGlobal('fetch', vi.fn(async () => policyResponse(true)));
 		const result = await handleOriginRequest(
 			originEvent({ body: { captchaData: 'bundle' }, host: 'alias.example.com', distributionDomainName: 'd111.cloudfront.net' }),
 			{ config: { ...BAKED, hosts: ['alias.example.com', 'd111.cloudfront.net'] }, kvs: liveKvs() }
